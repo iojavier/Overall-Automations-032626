@@ -1,596 +1,787 @@
-import streamlit as st
-import pandas as pd
+"""
+Debt Collection Summary (Volare) — Streamlit App
+Optimized: deduplicated aggregation logic, vectorized percentage calc,
+           list-then-concat accumulation, pre-compiled regex, column-type
+           dispatch in Excel writer.
+"""
+import re
 import datetime
 from io import BytesIO
+
+import pandas as pd
 from pandas import ExcelWriter
-import numpy as np
-import re
+import streamlit as st
 
-# ----------------------------------------------------------------------
-# GLOBAL CONSTANTS
-# ----------------------------------------------------------------------
-BALANCE_ORDER = ["0-49999.99", "50000.00-99999.99", "100000.00 and up"]
+# ── Constants ────────────────────────────────────────────────────────────────
+
 SUMMARY_COLUMNS = [
-    'CYCLE', 'DATE', 'CLIENT', 'COLLECTORS', 'ACCOUNTS', 'TOTAL DIALED', 'PENETRATION RATE',
-    'CONNECTED NU', 'CONNECTED UNIQUE', 'TOTAL RPC', 'RPC', 'PTP', 'BANK ESCALATION',
-    'CONNECTED % NU', 'CONNECTED % UNIQUE', 'RPC %', 'PTP %', 'TOTAL TALK TIME',
-    'TALK TIME AVE', 'CONNECTED AVE', 'TOTAL BALANCE', 'NEG DROP', 'SYSTEM DROP', 'CALL DROP RATE'
+    'CYCLE', 'DATE', 'CLIENT',
+    'ACCOUNTS', 'TOTAL DIALED', 'PENETRATION RATE',
+    'CONNECTED NU', 'CONNECTED UNIQUE', 'TOTAL RPC', 'PTP',
+    'CONNECTED % NU', 'CONNECTED % UNIQUE', 'RPC %', 'PTP %',
+    'TOTAL TALK TIME', 'TALK TIME AVE',
+    'TOTAL BALANCE', 'NEG DROP', 'SYSTEM DROP', 'CALL DROP RATE',
 ]
-PERCENTAGE_COLS = ['PENETRATION RATE', 'CONNECTED % NU', 'CONNECTED % UNIQUE',
-                   'RPC %', 'PTP %', 'CALL DROP RATE']
-NUMERICAL_COLS = ['COLLECTORS', 'ACCOUNTS', 'TOTAL DIALED', 'CONNECTED NU', 'CONNECTED UNIQUE',
-                  'TOTAL RPC', 'RPC', 'PTP', 'BANK ESCALATION', 'TOTAL BALANCE',
-                  'NEG DROP', 'SYSTEM DROP', 'CONNECTED AVE']
 
-st.set_page_config(layout="wide", page_title="Debt Collection Summary",
-                   page_icon="chart", initial_sidebar_state="expanded")
+PERCENTAGE_COLS = [
+    'PENETRATION RATE', 'CONNECTED % NU', 'CONNECTED % UNIQUE',
+    'RPC %', 'PTP %', 'CALL DROP RATE',
+]
+
+NUMERICAL_COLS = [
+    'ACCOUNTS', 'TOTAL DIALED', 'CONNECTED NU', 'CONNECTED UNIQUE',
+    'TOTAL RPC', 'PTP', 'TOTAL BALANCE', 'NEG DROP', 'SYSTEM DROP',
+]
+
+BALANCE_RANGES = [
+    (0,        49_999.99,    "0-49999.99"),
+    (50_000,   99_999.99,    "50000.00-99999.99"),
+    (100_000,  float('inf'), "100000.00 and up"),
+]
+
+SHEET_ORDER = [
+    'Combined', 'Overall Combined Summary', 'Overall Combined Cycles',
+    'Predictive', 'Manual',
+    'Combined Cycles', 'Predictive Cycles', 'Manual Cycles',
+    'Predictive Cycles (Total)',
+    'Combined Balances', 'Predictive Balances', 'Manual Balances',
+]
+
+# Pre-compiled regex — avoids recompiling on every row/call
+_RE_PTP_NEW   = re.compile(r'1_\d{11} - PTP NEW', re.IGNORECASE)
+_RE_EXCLUDED  = re.compile(
+    r'Broken Promise|New files imported'
+    r'|Updates when case reassign to another collector'
+    r'|NDF IN ICS|FOR PULL OUT|END OF HANDLING PERIOD'
+    r'|New Assignment -|broadcast|File Unhold',
+    re.IGNORECASE,
+)
+_RE_RPC_ESC   = re.compile(r'bank escalation|rpc', re.IGNORECASE)
+_RE_NEG_DROP  = re.compile(r'NEGATIVE CALLOUTS - CALL DROP', re.IGNORECASE)
+_RE_DROPPED   = re.compile(r'DROPPED', re.IGNORECASE)
+_RE_CYCLE_NUM = re.compile(r'Cycle (\d+)')
+
+_PCT_SET  = set(PERCENTAGE_COLS)
+_NUM_SET  = set(NUMERICAL_COLS)
+_TIME_SET = {'TOTAL TALK TIME', 'TALK TIME AVE'}
+
+# ── Page config ───────────────────────────────────────────────────────────────
+
+st.set_page_config(
+    layout="wide",
+    page_title="Debt Collection Summary (Volare)",
+    page_icon="📊",
+    initial_sidebar_state="expanded",
+)
 st.title('Debt Collection Summary')
 
-# ----------------------------------------------------------------------
-# DATA LOADING
-# ----------------------------------------------------------------------
+# ── Utility helpers ───────────────────────────────────────────────────────────
+
+def _pct(n, d) -> float:
+    return n / d if d else 0.0
+
+def _empty_summary() -> pd.DataFrame:
+    return pd.DataFrame(columns=SUMMARY_COLUMNS)
+
+def _cycle_sort_key(k: str) -> int:
+    m = _RE_CYCLE_NUM.search(k)
+    return int(m.group(1)) if m else 9999
+
+def _valid_cycles(series: pd.Series) -> list:
+    bad = {'', 'unknown', 'na'}
+    return [c for c in series.unique() if str(c).lower() not in bad]
+
+def _pct_str_to_float(series: pd.Series) -> pd.Series:
+    """'12.34%' → 0.1234"""
+    return (
+        series.astype(str)
+        .str.rstrip('%')
+        .str.replace(',', '', regex=False)
+        .pipe(pd.to_numeric, errors='coerce')
+        .fillna(0)
+        / 100
+    )
+
+def format_seconds_to_hms(seconds) -> str:
+    if pd.isna(seconds) or seconds <= 0:
+        return "00:00:00"
+    s = int(seconds)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def hms_to_seconds(hms) -> int:
+    v = str(hms).strip()
+    if not v or v == "00:00:00":
+        return 0
+    try:
+        h, m, s = v.split(':')
+        return int(h) * 3600 + int(m) * 60 + int(s)
+    except Exception:
+        return 0
+
+# ── Data loading / cleaning ───────────────────────────────────────────────────
+
 @st.cache_data
-def load_data(uploaded_file):
+def load_data(uploaded_file) -> pd.DataFrame:
     df = pd.read_excel(uploaded_file)
     df.columns = df.columns.str.strip().str.upper()
     df['DATE'] = pd.to_datetime(df['DATE'], errors='coerce')
     return df
 
-# ----------------------------------------------------------------------
-# EXCEL FORMATS
-# ----------------------------------------------------------------------
-def setup_excel_formats(workbook):
-    return {
-        'title': workbook.add_format({'bold': True, 'font_size': 14, 'align': 'center',
-                                      'valign': 'vcenter', 'bg_color': '#A42A25', 'font_color': 'white'}),
-        'center': workbook.add_format({'align': 'center', 'valign': 'vcenter', 'border': 1}),
-        'header': workbook.add_format({'align': 'center', 'valign': 'vcenter',
-                                       'bg_color': '#D9B229', 'font_color': 'white', 'bold': True}),
-        'comma': workbook.add_format({'align': 'center', 'valign': 'vcenter',
-                                      'border': 1, 'num_format': '#,##0'}),
-        'percent': workbook.add_format({'align': 'center', 'valign': 'vcenter',
-                                        'border': 1, 'num_format': '0.00%'}),
-        'date': workbook.add_format({'align': 'center', 'valign': 'vcenter',
-                                     'border': 1, 'num_format': 'yyyy-mm-dd'}),
-        'time': workbook.add_format({'align': 'center', 'valign': 'vcenter',
-                                     'border': 1, 'num_format': 'hh:mm:ss'})
-    }
 
-# ----------------------------------------------------------------------
-# EXCEL WRITER – FIXED DATE HANDLING
-# ----------------------------------------------------------------------
-def write_excel_sheet(writer, sheet_name, df_dict, formats):
-    if not df_dict:
-        return
-
-    worksheet = writer.book.add_worksheet(sheet_name)
-    current_row = 0
-
-    # Sorting logic
-    if sheet_name.endswith('Cycles') or sheet_name == 'Predictive Cycles (Total)':
-        sorted_items = sorted(
-            df_dict.items(),
-            key=lambda x: int(re.search(r'Cycle (\d+)', x[0]).group(1))
-            if re.search(r'Cycle (\d+)', x[0]) else float('inf')
-        )
-    elif sheet_name.endswith('Balances'):
-        sorted_items = sorted(
-            df_dict.items(),
-            key=lambda x: (
-                int(re.search(r'Cycle (\d+)', x[0]).group(1))
-                if re.search(r'Cycle (\d+)', x[0]) else float('inf'),
-                BALANCE_ORDER.index(re.search(r'Balance (.+)$', x[0]).group(1))
-                if re.search(r'Balance (.+)$', x[0]) else float('inf')
-            )
-        )
-    else:
-        sorted_items = list(df_dict.items())
-
-    for title, df in sorted_items:
-        if df.empty:
-            continue
-
-        df_excel = df.copy()
-        if 'DATE' in df_excel.columns:
-            df_excel = df_excel.sort_values(by=['DATE'], na_position='first')
-
-        # Clean numbers
-        for col in NUMERICAL_COLS:
-            if col in df_excel.columns:
-                df_excel[col] = pd.to_numeric(df_excel[col], errors='coerce').fillna(0)
-
-        # Clean percentages (if stored as string)
-        for col in PERCENTAGE_COLS:
-            if col in df_excel.columns and df_excel[col].dtype == 'object':
-                df_excel[col] = (df_excel[col].astype(str)
-                                 .str.rstrip('%').str.replace(',', '')
-                                 .astype(float).fillna(0) / 100)
-
-        # Title
-        worksheet.merge_range(current_row, 0, current_row, len(df_excel.columns) - 1, title, formats['title'])
-        current_row += 1
-
-        # Headers + column width
-        for col_num, col_name in enumerate(df_excel.columns):
-            worksheet.write(current_row, col_num, col_name, formats['header'])
-            max_len = max(df_excel[col_name].astype(str).str.len().max(), len(col_name)) + 2
-            worksheet.set_column(col_num, col_num, max_len)
-        current_row += 1
-
-        # Data rows
-        for row_num in range(len(df_excel)):
-            for col_num, col_name in enumerate(df_excel.columns):
-                value = df_excel.iloc[row_num, col_num]
-
-                if col_name == 'DATE':
-                    if pd.isna(value):
-                        worksheet.write_blank(current_row + row_num, col_num, None, formats['center'])
-                    elif isinstance(value, str) and ' to ' in value:
-                        # FIXED: Date range string like "2025-11-03 to 2025-11-29"
-                        worksheet.write_string(current_row + row_num, col_num, value, formats['center'])
-                    else:
-                        try:
-                            dt_val = pd.to_datetime(value).to_pydatetime()
-                            worksheet.write_datetime(current_row + row_num, col_num, dt_val, formats['date'])
-                        except:
-                            worksheet.write_string(current_row + row_num, col_num, str(value), formats['center'])
-                elif col_name == 'TOTAL BALANCE':
-                    worksheet.write_number(current_row + row_num, col_num, float(value), formats['comma'])
-                elif col_name in PERCENTAGE_COLS:
-                    worksheet.write_number(current_row + row_num, col_num, float(value), formats['percent'])
-                elif col_name in ['TOTAL TALK TIME', 'TALK TIME AVE']:
-                    worksheet.write_string(current_row + row_num, col_num, str(value), formats['time'])
-                else:
-                    worksheet.write(current_row + row_num, col_num, value, formats['center'])
-        current_row += len(df_excel) + 2
-
-def to_excel(summary_groups):
-    output = BytesIO()
-    order = ['Combined', 'Overall Combined Summary', 'Predictive', 'Manual',
-             'Combined Cycles', 'Predictive Cycles', 'Manual Cycles', 'Predictive Cycles (Total)',
-             'Combined Balances', 'Predictive Balances', 'Manual Balances']
-    ordered_groups = {k: summary_groups[k] for k in order if k in summary_groups}
-
-    with ExcelWriter(output, engine='xlsxwriter') as writer:
-        formats = setup_excel_formats(writer.book)
-        for sheet_name, df_dict in ordered_groups.items():
-            write_excel_sheet(writer, sheet_name, df_dict, formats)
-    return output.getvalue()
-
-# ----------------------------------------------------------------------
-# FILE PROCESSING
-# ----------------------------------------------------------------------
-def process_file(df):
-    string_cols = ['DEBTOR', 'STATUS', 'REMARK', 'CALL STATUS', 'CARD NO.']
-    for col in string_cols:
+def process_file(df: pd.DataFrame) -> pd.DataFrame:
+    for col in ('DEBTOR', 'STATUS', 'REMARK', 'CALL STATUS', 'CARD NO.'):
         if col in df.columns:
             df[col] = df[col].fillna('').astype(str)
 
-    # Filters
-    filter_conditions = []
+    masks = []
     if 'REMARK BY' in df.columns:
-        filter_conditions.append(df['REMARK BY'] != 'SPMADRID')
+        masks.append(df['REMARK BY'] != 'SPMADRID')
     if 'DEBTOR' in df.columns:
-        filter_conditions.append(~df['DEBTOR'].str.contains("DEFAULT_LEAD_", case=False, na=False))
+        masks.append(~df['DEBTOR'].str.contains("DEFAULT_LEAD_", case=False, na=False))
     if 'STATUS' in df.columns:
-        filter_conditions.append(~df['STATUS'].str.contains('ABORT', na=False))
+        masks.append(~df['STATUS'].str.contains('ABORT', na=False))
     if 'REMARK' in df.columns:
-        filter_conditions.append(~df['REMARK'].str.contains(r'1_\d{11} - PTP NEW', case=False, na=False, regex=True))
-        excluded = ["Broken Promise", "New files imported", "Updates when case reassign to another collector",
-                    "NDF IN ICS", "FOR PULL OUT (END OF HANDLING PERIOD)", "END OF HANDLING PERIOD",
-                    "New Assignment -", "broadcast", "File Unhold"]
-        filter_conditions.append(~df['REMARK'].str.contains('|'.join(excluded), case=False, na=False))
-
-    if filter_conditions:
-        df = df[pd.concat(filter_conditions, axis=1).all(axis=1)]
+        masks.append(~df['REMARK'].str.contains(_RE_PTP_NEW,  na=False))
+        masks.append(~df['REMARK'].str.contains(_RE_EXCLUDED, na=False))
+    if masks:
+        df = df[pd.concat(masks, axis=1).all(axis=1)]
 
     if 'CARD NO.' in df.columns:
         df['CYCLE'] = df['CARD NO.'].str[:2].fillna('Unknown')
 
-    numeric_cols = {'CALL DURATION': 'coerce', 'TALK TIME DURATION': 'coerce',
-                    'PTP AMOUNT': 'coerce', 'BALANCE': 'coerce'}
-    for col, err in numeric_cols.items():
+    for col in ('CALL DURATION', 'TALK TIME DURATION', 'PTP AMOUNT', 'BALANCE'):
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors=err).fillna(0)
-
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
     return df
 
-# ----------------------------------------------------------------------
-# TIME HELPERS
-# ----------------------------------------------------------------------
-def format_seconds_to_hms(seconds):
-    if pd.isna(seconds) or seconds <= 0:
-        return "00:00:00"
-    seconds = int(seconds)
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
 
-def hms_to_seconds(hms):
-    if pd.isna(hms) or str(hms).strip() == "00:00:00":
-        return 0
-    try:
-        h, m, s = map(int, str(hms).split(':'))
-        return h * 3600 + m * 60 + s
-    except:
-        return 0
+def apply_date_filter(df: pd.DataFrame, start, end) -> pd.DataFrame:
+    if 'DATE' not in df.columns or df.empty:
+        return df
+    lo = pd.Timestamp(start)
+    hi = pd.Timestamp(end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    return df.loc[(df['DATE'] >= lo) & (df['DATE'] <= hi)].copy()
 
-# ----------------------------------------------------------------------
-# METRIC CALCULATION (unchanged)
-# ----------------------------------------------------------------------
-def calculate_metrics(group):
-    if 'CALL DURATION' not in group.columns or 'REMARK BY' not in group.columns:
-        return None
+# ── Metric / summary calculation ──────────────────────────────────────────────
 
-    collectors = group[group['CALL DURATION'] > 0]['REMARK BY'].nunique()
-    if collectors == 0:
-        return None
-
+def calculate_metrics(group: pd.DataFrame) -> dict | None:
     if 'DEBTOR ID' not in group.columns:
         return None
 
-    accounts = group['DEBTOR ID'].nunique()
-    total_dialed = len(group)
-    connected_nu = (group['TALK TIME DURATION'] > 0).sum() if 'TALK TIME DURATION' in group.columns else 0
-    connected_unique = group[group['TALK TIME DURATION'] > 0]['DEBTOR ID'].nunique() if 'TALK TIME DURATION' in group.columns else 0
+    conn_m = group['TALK TIME DURATION'] > 0
+    ptp_m  = group['PTP AMOUNT'] > 0
+    rpc_m  = group['STATUS'].str.contains(_RE_RPC_ESC, na=False)
 
-    total_rpc = rpc = ptp = bank_escalation = 0
-    if all(col in group.columns for col in ['PTP AMOUNT', 'STATUS', 'DEBTOR ID']):
-        ptp_mask = group['PTP AMOUNT'] > 0
-        rpc_escalation_mask = group['STATUS'].str.contains('bank escalation|rpc', case=False, na=False)
-        ptp_ids = group.loc[ptp_mask, 'DEBTOR ID']
-        rpc_escalation_ids = group.loc[rpc_escalation_mask, 'DEBTOR ID']
-        total_rpc = len(pd.concat([ptp_ids, rpc_escalation_ids]).unique())
+    accounts         = group['DEBTOR ID'].nunique()
+    total_dialed     = len(group)
+    connected_nu     = int(conn_m.sum())
+    connected_unique = group.loc[conn_m, 'DEBTOR ID'].nunique()
+    total_rpc        = group.loc[ptp_m | rpc_m, 'DEBTOR ID'].nunique()
+    ptp              = group.loc[ptp_m & conn_m, 'DEBTOR ID'].nunique()
 
-        rpc = group.loc[(group['STATUS'].str.contains('rpc', case=False, na=False)) &
-                        (group['TALK TIME DURATION'] > 0), 'DEBTOR ID'].nunique()
-        ptp = group.loc[ptp_mask & (group['TALK TIME DURATION'] > 0), 'DEBTOR ID'].nunique()
-        bank_escalation = group.loc[(group['STATUS'].str.contains('bank escalation', case=False, na=False)) &
-                                    (group['TALK TIME DURATION'] > 0), 'DEBTOR ID'].nunique()
-
-    total_talk_time_secs = group['TALK TIME DURATION'].sum() if 'TALK TIME DURATION' in group.columns else 0
-    total_talk_time = format_seconds_to_hms(total_talk_time_secs)
-    talk_time_ave = format_seconds_to_hms(total_talk_time_secs / connected_nu) if connected_nu else "00:00:00"
-    connected_ave = round(connected_nu / collectors, 2)
-
-    total_balance = group.loc[group['PTP AMOUNT'] > 0, 'BALANCE'].sum() if 'BALANCE' in group.columns else 0
-    neg_drop = group['STATUS'].str.contains('NEGATIVE CALLOUTS - CALL DROP', case=False, na=False).sum() if 'STATUS' in group.columns else 0
-    system_drop = group['STATUS'].str.contains('DROPPED', case=False, na=False).sum() if 'STATUS' in group.columns else 0
-
-    def pct(n, d): return n / d if d else 0.0
-    penetration_rate = f"{pct(total_dialed, accounts)*100:.2f}%"
-    connected_nu_rate = f"{pct(connected_nu, total_dialed)*100:.2f}%"
-    connected_unique_rate = f"{pct(connected_unique, accounts)*100:.2f}%"
-    rpc_rate = f"{pct(total_rpc, connected_unique)*100:.2f}%" if connected_unique else "0.00%"
-    ptp_rate = f"{pct(ptp, total_rpc)*100:.2f}%" if total_rpc else "0.00%"
-    call_drop_rate = f"{pct(system_drop, connected_nu)*100:.2f}%" if connected_nu else "0.00%"
+    talk_secs    = group['TALK TIME DURATION'].sum()
+    cnuf         = float(connected_nu)
+    neg_drop     = int(group['STATUS'].str.contains(_RE_NEG_DROP, na=False).sum())
+    system_drop  = int(group['STATUS'].str.contains(_RE_DROPPED,  na=False).sum())
+    total_balance= group.loc[ptp_m, 'BALANCE'].sum()
 
     return {
-        'COLLECTORS': collectors, 'ACCOUNTS': accounts, 'TOTAL DIALED': total_dialed,
-        'PENETRATION RATE': penetration_rate, 'CONNECTED NU': connected_nu,
-        'CONNECTED UNIQUE': connected_unique, 'TOTAL RPC': total_rpc, 'RPC': rpc,
-        'PTP': ptp, 'BANK ESCALATION': bank_escalation,
-        'CONNECTED % NU': connected_nu_rate, 'CONNECTED % UNIQUE': connected_unique_rate,
-        'RPC %': rpc_rate, 'PTP %': ptp_rate,
-        'TOTAL TALK TIME': total_talk_time, 'TALK TIME AVE': talk_time_ave,
-        'CONNECTED AVE': connected_ave, 'TOTAL BALANCE': total_balance,
-        'NEG DROP': neg_drop, 'SYSTEM DROP': system_drop, 'CALL DROP RATE': call_drop_rate
+        'ACCOUNTS':           accounts,
+        'TOTAL DIALED':       total_dialed,
+        'PENETRATION RATE':   f"{_pct(total_dialed, accounts)*100:.2f}%",
+        'CONNECTED NU':       connected_nu,
+        'CONNECTED UNIQUE':   connected_unique,
+        'TOTAL RPC':          total_rpc,
+        'PTP':                ptp,
+        'CONNECTED % NU':     f"{_pct(cnuf, total_dialed)*100:.2f}%",
+        'CONNECTED % UNIQUE': f"{_pct(connected_unique, accounts)*100:.2f}%",
+        'RPC %':              f"{_pct(total_rpc, connected_unique)*100:.2f}%" if connected_unique else "0.00%",
+        'PTP %':              f"{_pct(ptp, total_rpc)*100:.2f}%"             if total_rpc        else "0.00%",
+        'TOTAL TALK TIME':    format_seconds_to_hms(talk_secs),
+        'TALK TIME AVE':      format_seconds_to_hms(talk_secs / cnuf)        if cnuf             else "00:00:00",
+        'TOTAL BALANCE':      total_balance,
+        'NEG DROP':           neg_drop,
+        'SYSTEM DROP':        system_drop,
+        'CALL DROP RATE':     f"{_pct(system_drop, cnuf)*100:.2f}%"          if cnuf             else "0.00%",
     }
 
-# ----------------------------------------------------------------------
-# SUMMARY HELPERS (unchanged)
-# ----------------------------------------------------------------------
-def calculate_summary(df, remark_types):
+
+def calculate_summary(df: pd.DataFrame, remark_types: list) -> pd.DataFrame:
     if 'REMARK TYPE' not in df.columns:
-        return pd.DataFrame(columns=SUMMARY_COLUMNS)
-    df_f = df[df['REMARK TYPE'].isin(remark_types)].copy()
-    if df_f.empty:
-        return pd.DataFrame(columns=SUMMARY_COLUMNS)
-    df_f['DATE'] = df_f['DATE'].dt.date
+        return _empty_summary()
+    sub = df[df['REMARK TYPE'].isin(remark_types)].copy()
+    if sub.empty:
+        return _empty_summary()
+    sub['DATE'] = sub['DATE'].dt.date
     rows = []
-    for (date, client), g in df_f.groupby(['DATE', 'CLIENT']):
+    for (date, client), g in sub.groupby(['DATE', 'CLIENT']):
         m = calculate_metrics(g)
         if m:
-            m.update({'DATE': date, 'CLIENT': client})
-            rows.append(m)
-    return pd.DataFrame(rows).reindex(columns=SUMMARY_COLUMNS, fill_value=0).sort_values('DATE') if rows else pd.DataFrame(columns=SUMMARY_COLUMNS)
+            rows.append({**m, 'DATE': date, 'CLIENT': client})
+    if not rows:
+        return _empty_summary()
+    return pd.DataFrame(rows).reindex(columns=SUMMARY_COLUMNS, fill_value=0).sort_values('DATE')
 
-def get_cycle_summary(df, remark_types):
-    result = {}
+
+def get_cycle_summary(df: pd.DataFrame, remark_types: list) -> dict:
     if 'CYCLE' not in df.columns:
-        return result
-    for cycle in [c for c in df['CYCLE'].unique() if c and str(c).lower() not in ['unknown', 'na']]:
-        c_df = df[df['CYCLE'] == cycle]
-        if c_df.empty:
-            continue
-        s = calculate_summary(c_df, remark_types)
+        return {}
+    result = {}
+    for cycle in _valid_cycles(df['CYCLE']):
+        s = calculate_summary(df[df['CYCLE'] == cycle], remark_types)
         if not s.empty:
             s['CYCLE'] = cycle
             result[f"Cycle {cycle}"] = s
     return result
 
-def get_balance_summary(df, remark_types):
-    ranges = [(0, 49999.99, "0-49999.99"), (50000.00, 99999.99, "50000.00-99999.99"), (100000.00, float('inf'), "100000.00 and up")]
-    result = {}
+
+def get_balance_summary(df: pd.DataFrame, remark_types: list) -> dict:
     if 'CYCLE' not in df.columns or 'BALANCE' not in df.columns:
-        return result
-    for cycle in [c for c in df['CYCLE'].unique() if c and str(c).lower() not in ['unknown', 'na']]:
+        return {}
+    result = {}
+    for cycle in _valid_cycles(df['CYCLE']):
         c_df = df[df['CYCLE'] == cycle]
-        for min_b, max_b, name in ranges:
-            b_df = c_df[(c_df['BALANCE'] >= min_b) & (c_df['BALANCE'] <= max_b)]
-            if b_df.empty:
-                continue
+        for lo, hi, name in BALANCE_RANGES:
+            b_df = c_df[(c_df['BALANCE'] >= lo) & (c_df['BALANCE'] <= hi)]
             s = calculate_summary(b_df, remark_types)
             if not s.empty:
                 s['CYCLE'] = cycle
                 result[f"Cycle {cycle} Balance {name}"] = s
     return result
 
-def combine_summaries(pred, man):
-    combined = {}
-    for key in set(pred) | set(man):
-        if "na" in key.lower():
-            continue
-        p = pred.get(key, pd.DataFrame(columns=SUMMARY_COLUMNS))
-        m = man.get(key, pd.DataFrame(columns=SUMMARY_COLUMNS))
-        df = pd.concat([p, m], ignore_index=True)
-        if df.empty:
-            continue
+# ── Aggregation — shared core ────────────────────────────────────────────────
 
-        df['DATE'] = pd.to_datetime(df['DATE']).dt.date
-        df['TOTAL_TALK_TIME_SECS'] = df['TOTAL TALK TIME'].apply(hms_to_seconds)
+def _build_aggregate_row(raw: pd.DataFrame, daily: pd.DataFrame) -> dict:
+    """
+    Single source of truth for rolling up raw + daily data into one metric row.
+    Used by all three aggregate_* functions below.
+    """
+    conn_m = raw['TALK TIME DURATION'] > 0
+    ptp_m  = raw['PTP AMOUNT'] > 0
+    rpc_m  = raw['STATUS'].str.contains(_RE_RPC_ESC, na=False)
 
-        for col in PERCENTAGE_COLS:
-            if col in df.columns:
-                df[col] = (df[col].astype(str).str.rstrip('%').str.replace(',', '').astype(float).fillna(0) / 100)
+    accounts         = raw['DEBTOR ID'].nunique()
+    connected_unique = raw.loc[conn_m, 'DEBTOR ID'].nunique()
+    total_rpc        = raw.loc[ptp_m | rpc_m, 'DEBTOR ID'].nunique()
+    ptp              = raw.loc[ptp_m & conn_m, 'DEBTOR ID'].nunique()
 
-        agg = {c: 'sum' for c in NUMERICAL_COLS if c in df.columns}
-        agg['TOTAL_TALK_TIME_SECS'] = 'sum'
-        g = df.groupby(['DATE', 'CLIENT'], as_index=False).agg(agg)
+    daily = daily.copy()
+    daily['_secs'] = daily['TOTAL TALK TIME'].map(hms_to_seconds)
+    total_dialed  = int(daily['TOTAL DIALED'].sum())
+    connected_nu  = int(daily['CONNECTED NU'].sum())
+    talk_secs     = int(daily['_secs'].sum())
+    neg_drop      = int(daily['NEG DROP'].sum())
+    system_drop   = int(daily['SYSTEM DROP'].sum())
+    total_balance = float(daily['TOTAL BALANCE'].sum())
 
-        g['TOTAL TALK TIME'] = g['TOTAL_TALK_TIME_SECS'].apply(format_seconds_to_hms)
-        g['TALK TIME AVE'] = g.apply(lambda r: format_seconds_to_hms(r['TOTAL_TALK_TIME_SECS'] / r['CONNECTED NU']) if r['CONNECTED NU'] > 0 else "00:00:00", axis=1)
-        g['CONNECTED AVE'] = g.apply(lambda r: round(r['CONNECTED NU'] / r['COLLECTORS'], 2) if r['COLLECTORS'] > 0 else 0, axis=1)
+    cnuf = float(connected_nu)
+    return {
+        'ACCOUNTS':           accounts,
+        'TOTAL DIALED':       total_dialed,
+        'CONNECTED NU':       connected_nu,
+        'CONNECTED UNIQUE':   connected_unique,
+        'TOTAL RPC':          total_rpc,
+        'PTP':                ptp,
+        'TOTAL TALK TIME':    format_seconds_to_hms(talk_secs),
+        'TALK TIME AVE':      format_seconds_to_hms(talk_secs / cnuf) if cnuf else "00:00:00",
+        'TOTAL BALANCE':      total_balance,
+        'NEG DROP':           neg_drop,
+        'SYSTEM DROP':        system_drop,
+        'PENETRATION RATE':   f"{_pct(total_dialed, accounts)*100:.2f}%",
+        'CONNECTED % NU':     f"{_pct(cnuf, total_dialed)*100:.2f}%",
+        'CONNECTED % UNIQUE': f"{_pct(connected_unique, accounts)*100:.2f}%",
+        'RPC %':              f"{_pct(total_rpc, connected_unique)*100:.2f}%" if connected_unique else "0.00%",
+        'PTP %':              f"{_pct(ptp, total_rpc)*100:.2f}%"              if total_rpc        else "0.00%",
+        'CALL DROP RATE':     f"{_pct(system_drop, cnuf)*100:.2f}%"           if cnuf             else "0.00%",
+    }
 
-        def pct(n, d): return n / d if d else 0.0
-        g['PENETRATION RATE'] = g.apply(lambda r: f"{pct(r['TOTAL DIALED'], r['ACCOUNTS'])*100:.2f}%", axis=1)
-        g['CONNECTED % NU'] = g.apply(lambda r: f"{pct(r['CONNECTED NU'], r['TOTAL DIALED'])*100:.2f}%", axis=1)
-        g['CONNECTED % UNIQUE'] = g.apply(lambda r: f"{pct(r['CONNECTED UNIQUE'], r['ACCOUNTS'])*100:.2f}%", axis=1)
-        g['RPC %'] = g.apply(lambda r: f"{pct(r['TOTAL RPC'], r['CONNECTED UNIQUE'])*100:.2f}%" if r['CONNECTED UNIQUE'] else "0.00%", axis=1)
-        g['PTP %'] = g.apply(lambda r: f"{pct(r['PTP'], r['TOTAL RPC'])*100:.2f}%" if r['TOTAL RPC'] else "0.00%", axis=1)
-        g['CALL DROP RATE'] = g.apply(lambda r: f"{pct(r['SYSTEM DROP'], r['CONNECTED NU'])*100:.2f}%" if r['CONNECTED NU'] else "0.00%", axis=1)
 
-        g = g.drop(columns=['TOTAL_TALK_TIME_SECS'], errors='ignore')
-        combined[key] = g.reindex(columns=SUMMARY_COLUMNS, fill_value=0).sort_values('DATE')
-    return combined
-
-# ----------------------------------------------------------------------
-# IMPROVED: Predictive Cycles (Total) & Overall Combined Summary
-# ----------------------------------------------------------------------
-def aggregate_cycles_by_cycle(cycle_dict, raw_predictive_df):
-    if not cycle_dict or raw_predictive_df.empty:
+def aggregate_cycles_by_cycle(cycle_dict: dict, raw_df: pd.DataFrame) -> dict:
+    if not cycle_dict or raw_df.empty:
         return {}
     out = {}
-    for key, df in cycle_dict.items():
-        match = re.search(r'Cycle (\d+)', key)
-        if not match:
+    for cycle in sorted({_RE_CYCLE_NUM.search(k).group(1)
+                         for k in cycle_dict if _RE_CYCLE_NUM.search(k)}):
+        key   = f"Cycle {cycle}"
+        raw_c = raw_df[raw_df['CYCLE'] == cycle]
+        daily = cycle_dict.get(key, _empty_summary())
+        if raw_c.empty or daily.empty:
             continue
-        cycle = match.group(1)
-        raw = raw_predictive_df[raw_predictive_df['CYCLE'] == cycle].copy()
-        if raw.empty:
-            continue
-
-        # Unique counts from raw
-        accounts = raw['DEBTOR ID'].nunique()
-        connected_mask = raw['TALK TIME DURATION'] > 0
-        connected_unique = raw[connected_mask]['DEBTOR ID'].nunique()
-        ptp_mask = raw['PTP AMOUNT'] > 0
-        rpc_escalation_mask = raw['STATUS'].str.contains('bank escalation|rpc', case=False, na=False)
-        total_rpc_ids = pd.concat([raw[ptp_mask]['DEBTOR ID'], raw[rpc_escalation_mask]['DEBTOR ID']]).unique()
-        total_rpc = len(total_rpc_ids)
-        rpc = raw[(raw['STATUS'].str.contains('rpc', case=False, na=False)) & connected_mask]['DEBTOR ID'].nunique()
-        ptp = raw[ptp_mask & connected_mask]['DEBTOR ID'].nunique()
-        bank_escalation = raw[(raw['STATUS'].str.contains('bank escalation', case=False, na=False)) & connected_mask]['DEBTOR ID'].nunique()
-
-        # Sums from daily summary
-        total_dialed = df['TOTAL DIALED'].sum()
-        connected_nu = df['CONNECTED NU'].sum()
-        total_talk_time_secs = df['TOTAL TALK TIME'].apply(hms_to_seconds).sum()
-        neg_drop = df['NEG DROP'].sum()
-        system_drop = df['SYSTEM DROP'].sum()
-        total_balance = df['TOTAL BALANCE'].sum()
-        collectors = df['COLLECTORS'].sum()
-
-        row = {
-            'CYCLE': cycle, 'COLLECTORS': collectors, 'ACCOUNTS': accounts,
-            'TOTAL DIALED': total_dialed, 'CONNECTED NU': connected_nu,
-            'CONNECTED UNIQUE': connected_unique, 'TOTAL RPC': total_rpc,
-            'RPC': rpc, 'PTP': ptp, 'BANK ESCALATION': bank_escalation,
-            'TOTAL TALK TIME': format_seconds_to_hms(total_talk_time_secs),
-            'TOTAL BALANCE': total_balance, 'NEG DROP': neg_drop, 'SYSTEM DROP': system_drop,
-        }
-        row['TALK TIME AVE'] = format_seconds_to_hms(total_talk_time_secs / connected_nu) if connected_nu else "00:00:00"
-        row['CONNECTED AVE'] = round(connected_nu / collectors, 2) if collectors else 0
-
-        def pct(n, d): return n / d if d else 0.0
-        row['PENETRATION RATE'] = f"{pct(total_dialed, accounts)*100:.2f}%"
-        row['CONNECTED % NU'] = f"{pct(connected_nu, total_dialed)*100:.2f}%"
-        row['CONNECTED % UNIQUE'] = f"{pct(connected_unique, accounts)*100:.2f}%"
-        row['RPC %'] = f"{pct(total_rpc, connected_unique)*100:.2f}%" if connected_unique else "0.00%"
-        row['PTP %'] = f"{pct(ptp, total_rpc)*100:.2f}%" if total_rpc else "0.00%"
-        row['CALL DROP RATE'] = f"{pct(system_drop, connected_nu)*100:.2f}%" if connected_nu else "0.00%"
-
+        row = {**_build_aggregate_row(raw_c, daily), 'CYCLE': cycle}
         out[key] = pd.DataFrame([row]).reindex(columns=SUMMARY_COLUMNS, fill_value=0)
     return out
 
-# FIXED: Safe date range handling
-def aggregate_overall_summary(raw_df, daily_summary_df):
-    if raw_df.empty or daily_summary_df.empty:
-        return pd.DataFrame(columns=SUMMARY_COLUMNS)
 
-    raw = raw_df.copy()
-    accounts = raw['DEBTOR ID'].nunique()
-    connected_mask = raw['TALK TIME DURATION'] > 0
-    connected_unique = raw[connected_mask]['DEBTOR ID'].nunique()
-    ptp_mask = raw['PTP AMOUNT'] > 0
-    rpc_escalation_mask = raw['STATUS'].str.contains('bank escalation|rpc', case=False, na=False)
-    total_rpc_ids = pd.concat([raw[ptp_mask]['DEBTOR ID'], raw[rpc_escalation_mask]['DEBTOR ID']]).unique()
-    total_rpc = len(total_rpc_ids)
-    rpc = raw[(raw['STATUS'].str.contains('rpc', case=False, na=False)) & connected_mask]['DEBTOR ID'].nunique()
-    ptp = raw[ptp_mask & connected_mask]['DEBTOR ID'].nunique()
-    bank_escalation = raw[(raw['STATUS'].str.contains('bank escalation', case=False, na=False)) & connected_mask]['DEBTOR ID'].nunique()
-
-    daily = daily_summary_df.copy()
-    daily['TOTAL_TALK_TIME_SECS'] = daily['TOTAL TALK TIME'].apply(hms_to_seconds)
-    total_dialed = daily['TOTAL DIALED'].sum()
-    connected_nu = daily['CONNECTED NU'].sum()
-    total_talk_time_secs = daily['TOTAL_TALK_TIME_SECS'].sum()
-    neg_drop = daily['NEG DROP'].sum()
-    system_drop = daily['SYSTEM DROP'].sum()
-    total_balance = daily['TOTAL BALANCE'].sum()
-    collectors = daily['COLLECTORS'].nunique()
-
-    date_min = pd.to_datetime(daily['DATE']).min()
-    date_max = pd.to_datetime(daily['DATE']).max()
-    date_range = f"{date_min.strftime('%Y-%m-%d')} to {date_max.strftime('%Y-%m-%d')}" if not pd.isna(date_min) else "N/A"
-
-    row = {
-        'CYCLE': 'All', 'DATE': date_range, 'CLIENT': 'All',
-        'COLLECTORS': collectors, 'ACCOUNTS': accounts,
-        'TOTAL DIALED': total_dialed, 'CONNECTED NU': connected_nu,
-        'CONNECTED UNIQUE': connected_unique, 'TOTAL RPC': total_rpc,
-        'RPC': rpc, 'PTP': ptp, 'BANK ESCALATION': bank_escalation,
-        'TOTAL TALK TIME': format_seconds_to_hms(total_talk_time_secs),
-        'TOTAL BALANCE': total_balance, 'NEG DROP': neg_drop, 'SYSTEM DROP': system_drop,
-    }
-    row['TALK TIME AVE'] = format_seconds_to_hms(total_talk_time_secs / connected_nu) if connected_nu else "00:00:00"
-    row['CONNECTED AVE'] = round(connected_nu / collectors, 2) if collectors else 0
-
-    def pct(n, d): return n / d if d else 0.0
-    row['PENETRATION RATE'] = f"{pct(total_dialed, accounts)*100:.2f}%"
-    row['CONNECTED % NU'] = f"{pct(connected_nu, total_dialed)*100:.2f}%"
-    row['CONNECTED % UNIQUE'] = f"{pct(connected_unique, accounts)*100:.2f}%"
-    row['RPC %'] = f"{pct(total_rpc, connected_unique)*100:.2f}%" if connected_unique else "0.00%"
-    row['PTP %'] = f"{pct(ptp, total_rpc)*100:.2f}%" if total_rpc else "0.00%"
-    row['CALL DROP RATE'] = f"{pct(system_drop, connected_nu)*100:.2f}%" if connected_nu else "0.00%"
-
+def aggregate_overall_summary(raw_df: pd.DataFrame, daily_df: pd.DataFrame) -> pd.DataFrame:
+    if raw_df.empty or daily_df.empty:
+        return _empty_summary()
+    row   = _build_aggregate_row(raw_df, daily_df)
+    dates = pd.to_datetime(daily_df['DATE'])
+    d_lo, d_hi = dates.min(), dates.max()
+    date_range = (f"{d_lo:%Y-%m-%d} to {d_hi:%Y-%m-%d}" if not pd.isna(d_lo) else "N/A")
+    row.update({'CYCLE': 'All', 'DATE': date_range, 'CLIENT': 'All'})
     return pd.DataFrame([row]).reindex(columns=SUMMARY_COLUMNS, fill_value=0)
 
-# ----------------------------------------------------------------------
-# MAIN APP
-# ----------------------------------------------------------------------
-uploaded_files = st.sidebar.file_uploader("Upload Daily Remark Files", type="xlsx", accept_multiple_files=True)
 
-if uploaded_files:
-    all_combined, all_predictive, all_manual = [], [], []
-    predictive_cycles, manual_cycles = {}, {}
-    predictive_balances, manual_balances = {}, {}
-    raw_predictive_all = pd.DataFrame()
-    raw_combined_all = pd.DataFrame()
+def aggregate_overall_combined_cycles(combined_cycle_dict: dict, raw_combined: pd.DataFrame) -> dict:
+    if not combined_cycle_dict or raw_combined.empty:
+        return {}
+    result = {}
+    for key, daily_df in combined_cycle_dict.items():
+        m = _RE_CYCLE_NUM.search(key)
+        if not m:
+            continue
+        cycle = m.group(1)
+        raw_c = raw_combined[raw_combined['CYCLE'] == cycle]
+        if raw_c.empty or daily_df.empty:
+            continue
+        row = {**_build_aggregate_row(raw_c, daily_df), 'CYCLE': cycle}
+        result[f"Cycle {cycle}"] = pd.DataFrame([row]).reindex(columns=SUMMARY_COLUMNS, fill_value=0)
+    return result
 
-    prog = st.progress(0)
-    for idx, f in enumerate(uploaded_files):
-        with st.spinner(f"Processing {f.name}..."):
-            df = load_data(f)
-            df = process_file(df)
 
-            follow_up = df[(df['REMARK TYPE'] == 'Follow Up') & (df['REMARK'].str.contains('Predictive', case=False, na=False))] if 'REMARK TYPE' in df.columns and 'REMARK' in df.columns else pd.DataFrame()
-            predictive = df[df['REMARK TYPE'] == 'Predictive'] if 'REMARK TYPE' in df.columns else pd.DataFrame()
-            outgoing = df[df['REMARK TYPE'] == 'Outgoing'] if 'REMARK TYPE' in df.columns else pd.DataFrame()
+def combine_summaries(pred: dict, man: dict) -> dict:
+    combined = {}
+    for key in set(pred) | set(man):
+        if 'na' in key.lower():
+            continue
+        df = pd.concat(
+            [pred.get(key, _empty_summary()), man.get(key, _empty_summary())],
+            ignore_index=True,
+        )
+        if df.empty:
+            continue
 
-            predictive_combined_df = pd.concat([follow_up, predictive], ignore_index=True)
-            combined_df = pd.concat([predictive_combined_df, outgoing], ignore_index=True)
+        df['DATE']  = pd.to_datetime(df['DATE']).dt.date
+        df['_secs'] = df['TOTAL TALK TIME'].map(hms_to_seconds)
 
-            raw_predictive_all = pd.concat([raw_predictive_all, predictive_combined_df], ignore_index=True)
-            raw_combined_all = pd.concat([raw_combined_all, combined_df], ignore_index=True)
+        for col in PERCENTAGE_COLS:
+            if col in df.columns:
+                df[col] = _pct_str_to_float(df[col])
 
-            all_combined.append(calculate_summary(combined_df, ['Predictive', 'Follow Up', 'Outgoing']))
-            all_predictive.append(calculate_summary(predictive_combined_df, ['Predictive', 'Follow Up']))
-            all_manual.append(calculate_summary(outgoing, ['Outgoing']))
+        agg = {c: 'sum' for c in NUMERICAL_COLS if c in df.columns}
+        agg['_secs'] = 'sum'
+        g = df.groupby(['DATE', 'CLIENT'], as_index=False).agg(agg)
 
-            for k, v in get_cycle_summary(predictive_combined_df, ['Predictive', 'Follow Up']).items():
-                predictive_cycles[k] = pd.concat([predictive_cycles.get(k, pd.DataFrame()), v], ignore_index=True)
-            for k, v in get_cycle_summary(outgoing, ['Outgoing']).items():
-                manual_cycles[k] = pd.concat([manual_cycles.get(k, pd.DataFrame()), v], ignore_index=True)
+        # Vectorised derived columns
+        g['TOTAL TALK TIME']    = g['_secs'].map(format_seconds_to_hms)
+        g['TALK TIME AVE']      = g.apply(
+            lambda r: format_seconds_to_hms(r['_secs'] / r['CONNECTED NU'])
+            if r['CONNECTED NU'] > 0 else "00:00:00", axis=1)
+        g['PENETRATION RATE']   = (g['TOTAL DIALED']     / g['ACCOUNTS'].replace(0, pd.NA)).fillna(0).mul(100).map("{:.2f}%".format)
+        g['CONNECTED % NU']     = (g['CONNECTED NU']     / g['TOTAL DIALED'].replace(0, pd.NA)).fillna(0).mul(100).map("{:.2f}%".format)
+        g['CONNECTED % UNIQUE'] = (g['CONNECTED UNIQUE'] / g['ACCOUNTS'].replace(0, pd.NA)).fillna(0).mul(100).map("{:.2f}%".format)
+        g['RPC %']              = (g['TOTAL RPC']        / g['CONNECTED UNIQUE'].replace(0, pd.NA)).fillna(0).mul(100).map("{:.2f}%".format)
+        g['PTP %']              = (g['PTP']              / g['TOTAL RPC'].replace(0, pd.NA)).fillna(0).mul(100).map("{:.2f}%".format)
+        g['CALL DROP RATE']     = (g['SYSTEM DROP']      / g['CONNECTED NU'].replace(0, pd.NA)).fillna(0).mul(100).map("{:.2f}%".format)
 
-            for k, v in get_balance_summary(predictive_combined_df, ['Predictive', 'Follow Up']).items():
-                predictive_balances[k] = pd.concat([predictive_balances.get(k, pd.DataFrame()), v], ignore_index=True)
-            for k, v in get_balance_summary(outgoing, ['Outgoing']).items():
-                manual_balances[k] = pd.concat([manual_balances.get(k, pd.DataFrame()), v], ignore_index=True)
+        combined[key] = (
+            g.drop(columns=['_secs'], errors='ignore')
+             .reindex(columns=SUMMARY_COLUMNS, fill_value=0)
+             .sort_values('DATE')
+        )
+    return combined
 
-        prog.progress((idx + 1) / len(uploaded_files))
+# ── Excel writing ─────────────────────────────────────────────────────────────
 
-    prog.empty()
-    st.success(f"Processed {len(uploaded_files)} file(s)")
-
-    combined_summary = pd.concat(all_combined, ignore_index=True).sort_values('DATE') if all_combined else pd.DataFrame(columns=SUMMARY_COLUMNS)
-    predictive_summary = pd.concat(all_predictive, ignore_index=True).sort_values('DATE') if all_predictive else pd.DataFrame(columns=SUMMARY_COLUMNS)
-    manual_summary = pd.concat(all_manual, ignore_index=True).sort_values('DATE') if all_manual else pd.DataFrame(columns=SUMMARY_COLUMNS)
-
-    combined_cycle = combine_summaries(predictive_cycles, manual_cycles)
-    combined_balance = combine_summaries(predictive_balances, manual_balances)
-    predictive_cycles_total = aggregate_cycles_by_cycle(predictive_cycles, raw_predictive_all)
-    overall_combined_total = aggregate_overall_summary(raw_combined_all, combined_summary)
-
-    # Display
-    st.write("## Overall Combined Summary (Daily)")
-    st.dataframe(combined_summary, use_container_width=True)
-
-    if not overall_combined_total.empty:
-        st.write("## Overall Combined Summary (Total Period)")
-        st.dataframe(overall_combined_total, use_container_width=True)
-
-    for title, df in [("Overall Predictive", predictive_summary), ("Overall Manual", manual_summary)]:
-        if not df.empty:
-            st.write(f"## {title} Summary")
-            st.dataframe(df, use_container_width=True)
-
-    for label, data in [("Per Cycle Combined", combined_cycle), ("Per Cycle Predictive", predictive_cycles),
-                        ("Per Cycle Manual", manual_cycles), ("Predictive Cycles (Total)", predictive_cycles_total)]:
-        if data:
-            st.write(f"## {label}")
-            for k in sorted(data, key=lambda x: int(re.search(r'Cycle (\d+)', x).group(1)) if re.search(r'Cycle (\d+)', x) else float('inf')):
-                if "na" not in k.lower() and not data[k].empty:
-                    with st.container():
-                        st.subheader(k)
-                        st.dataframe(data[k].sort_values('DATE') if 'DATE' in data[k].columns else data[k], use_container_width=True)
-
-    for label, data in [("Per Balance Combined", combined_balance), ("Per Balance Predictive", predictive_balances),
-                        ("Per Balance Manual", manual_balances)]:
-        if data:
-            st.write(f"## {label}")
-            for k in sorted(data, key=lambda x: (
-                int(re.search(r'Cycle (\d+)', x).group(1)) if re.search(r'Cycle (\d+)', x) else float('inf'),
-                BALANCE_ORDER.index(re.search(r'Balance (.+)$', x).group(1)) if re.search(r'Balance (.+)$', x) else len(BALANCE_ORDER)
-            )):
-                if not data[k].empty:
-                    with st.container():
-                        st.subheader(k)
-                        st.dataframe(data[k].sort_values('DATE'), use_container_width=True)
-
-    # Excel Export
-    summary_groups = {
-        'Combined': {'Combined Summary (Daily)': combined_summary},
-        'Overall Combined Summary': {'Overall Combined Summary (Total)': overall_combined_total},
-        'Predictive': {'Predictive Summary': predictive_summary},
-        'Manual': {'Manual Summary': manual_summary},
-        'Combined Cycles': {k: v for k, v in combined_cycle.items() if "na" not in k.lower()},
-        'Predictive Cycles': {k: v for k, v in predictive_cycles.items() if "na" not in k.lower()},
-        'Manual Cycles': {k: v for k, v in manual_cycles.items() if "na" not in k.lower()},
-        'Predictive Cycles (Total)': predictive_cycles_total,
-        'Combined Balances': combined_balance,
-        'Predictive Balances': predictive_balances,
-        'Manual Balances': manual_balances,
+def _excel_formats(wb) -> dict:
+    base = {'align': 'center', 'valign': 'vcenter', 'border': 1}
+    return {
+        'title':   wb.add_format({'bold': True, 'font_size': 14, 'align': 'center',
+                                  'valign': 'vcenter', 'bg_color': '#A42A25', 'font_color': 'white'}),
+        'header':  wb.add_format({'bold': True, 'bg_color': '#D9B229', 'font_color': 'white',
+                                  'align': 'center', 'valign': 'vcenter', 'border': 1}),
+        'comma':   wb.add_format({**base, 'num_format': '#,##0'}),
+        'percent': wb.add_format({**base, 'num_format': '0.00%'}),
+        'date':    wb.add_format({**base, 'num_format': 'yyyy-mm-dd'}),
+        'time':    wb.add_format({**base, 'num_format': 'hh:mm:ss'}),
+        'center':  wb.add_format(base),
     }
 
-    excel_bytes = to_excel(summary_groups)
-    st.sidebar.download_button(
-        label="Download All Summaries as Excel",
-        data=excel_bytes,
-        file_name=f"Debt_Collection_Summary_{datetime.datetime.now():%Y%m%d_%H%M%S}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-    st.sidebar.success("Ready for download!")
 
+def _write_cell(ws, row: int, col: int, col_name: str, value, fmts: dict):
+    """Single-cell write dispatched by column type — no branching overhead per sheet."""
+    if col_name == 'DATE':
+        try:
+            ws.write_datetime(row, col, pd.to_datetime(value).to_pydatetime(), fmts['date'])
+        except Exception:
+            ws.write(row, col, str(value), fmts['center'])
+    elif col_name == 'TOTAL BALANCE':
+        ws.write_number(row, col, float(value), fmts['comma'])
+    elif col_name in _PCT_SET:
+        try:
+            ws.write_number(row, col, float(value), fmts['percent'])
+        except Exception:
+            try:
+                ws.write_number(row, col, float(str(value).rstrip('%').replace(',', '')) / 100, fmts['percent'])
+            except Exception:
+                ws.write(row, col, str(value), fmts['center'])
+    elif col_name in _TIME_SET:
+        ws.write_string(row, col, str(value), fmts['time'])
+    elif col_name in _NUM_SET:
+        try:
+            ws.write_number(row, col, float(value), fmts['comma'])
+        except Exception:
+            ws.write(row, col, value, fmts['center'])
+    else:
+        ws.write(row, col, value, fmts['center'])
+
+
+def _sorted_sheet_items(sheet_name: str, df_dict: dict) -> list:
+    if sheet_name == 'Overall Combined Summary':
+        main  = next((k for k in df_dict if 'Total' in k), None)
+        items = [(main, df_dict[main])] if main else []
+        items += [(k, v) for k, v in df_dict.items() if k != main]
+        return items
+    if sheet_name in ('Overall Combined Cycles', 'Predictive Cycles (Total)'):
+        keys = sorted([k for k in df_dict if k.startswith('Cycle ')], key=_cycle_sort_key)
+        return [(k, df_dict[k]) for k in keys]
+    return sorted(df_dict.items(), key=lambda x: _cycle_sort_key(x[0]))
+
+
+def write_excel_sheet(writer, sheet_name: str, df_dict: dict, fmts: dict):
+    if not df_dict:
+        return
+    ws  = writer.book.add_worksheet(sheet_name)
+    cur = 0
+    for title, df in _sorted_sheet_items(sheet_name, df_dict):
+        if df.empty:
+            continue
+        display = df.copy()
+        if 'DATE' in display.columns:
+            display = display.sort_values('DATE', na_position='first')
+        for col in NUMERICAL_COLS:
+            if col in display.columns:
+                display[col] = pd.to_numeric(display[col], errors='coerce').fillna(0)
+        for col in PERCENTAGE_COLS:
+            if col in display.columns:
+                display[col] = _pct_str_to_float(display[col])
+
+        ws.merge_range(cur, 0, cur, len(display.columns) - 1, title, fmts['title'])
+        cur += 1
+        for ci, cn in enumerate(display.columns):
+            ws.write(cur, ci, cn, fmts['header'])
+            ws.set_column(ci, ci, 20)
+        cur += 1
+        for ri in range(len(display)):
+            for ci, cn in enumerate(display.columns):
+                _write_cell(ws, cur + ri, ci, cn, display.iat[ri, ci], fmts)
+        cur += len(display) + 2
+
+
+def to_excel(summary_groups: dict) -> bytes:
+    output  = BytesIO()
+    ordered = {k: summary_groups[k] for k in SHEET_ORDER if k in summary_groups}
+    with ExcelWriter(output, engine='xlsxwriter') as writer:
+        fmts = _excel_formats(writer.book)
+        for sheet_name, df_dict in ordered.items():
+            write_excel_sheet(writer, sheet_name, df_dict, fmts)
+    return output.getvalue()
+
+
+def create_raw_cycle_breakdown_excel(
+    raw_pred, raw_combined, pred_cycles_dict, overall_total_df, overall_cycles_dict
+) -> bytes:
+    RAW_HDRS  = ['ACCOUNTS', 'TOTAL DIALED', 'CONNECTED NU', 'CONNECTED UNIQUE',
+                 'TOTAL RPC', 'PTP', 'NEG DROP', 'SYSTEM DROP']
+    LIST_HDRS = ['Raw Accounts', 'Raw Connected NU', 'Raw Connected Unique',
+                 'Raw Total RPC', 'Raw PTP', 'Raw Negative Drop', 'Raw System Drop']
+
+    output = BytesIO()
+    with ExcelWriter(output, engine='xlsxwriter') as writer:
+        wb      = writer.book
+        bold    = wb.add_format({'bold': True, 'font_size': 14})
+        hdr_fmt = wb.add_format({'bold': True, 'bg_color': '#E6F0FA', 'border': 1, 'align': 'center'})
+        num_fmt = wb.add_format({'num_format': '#,##0', 'align': 'center', 'border': 1})
+        ctr_fmt = wb.add_format({'align': 'center', 'border': 1})
+        no_data = wb.add_format({'bold': True, 'font_size': 12})
+
+        def write_cycle_block(ws, cycle_key, summary_row, raw_df, start, is_combined=False):
+            ws.write(start, 0, f"{cycle_key} (Combined)" if is_combined else cycle_key, bold)
+            r = start + 2
+
+            for ci, h in enumerate(RAW_HDRS):
+                ws.write(r, ci, h, hdr_fmt)
+            r += 1
+            for ci, h in enumerate(RAW_HDRS):
+                ws.write_number(r, ci, float(summary_row.get(h, 0)), num_fmt)
+            r += 3
+
+            for ci, h in enumerate(LIST_HDRS):
+                ws.write(r, ci, h, hdr_fmt)
+            r += 1
+
+            if raw_df.empty:
+                ws.write(r, 0, "(No raw data)", no_data)
+                return r + 5
+
+            conn_m = raw_df['TALK TIME DURATION'] > 0
+            ptp_m  = raw_df['PTP AMOUNT'] > 0
+            rpc_m  = raw_df['STATUS'].str.contains(_RE_RPC_ESC, na=False)
+            neg_m  = raw_df['STATUS'].str.contains(_RE_NEG_DROP, na=False)
+            drp_m  = raw_df['STATUS'].str.contains(_RE_DROPPED,  na=False)
+
+            lists = [
+                sorted(raw_df['CARD NO.'].dropna().unique()),
+                list(raw_df.loc[conn_m, 'CARD NO.']),
+                sorted(raw_df.loc[conn_m, 'CARD NO.'].dropna().unique()),
+                sorted(raw_df.loc[ptp_m | rpc_m, 'CARD NO.'].dropna().unique()),
+                sorted(raw_df.loc[ptp_m & conn_m, 'CARD NO.'].dropna().unique()),
+                sorted(raw_df.loc[neg_m, 'CARD NO.'].dropna().unique()),
+                sorted(raw_df.loc[drp_m, 'CARD NO.'].dropna().unique()),
+            ]
+            max_r = max((len(l) for l in lists), default=0)
+            for ri in range(max_r):
+                for ci, lst in enumerate(lists):
+                    if ri < len(lst):
+                        ws.write(r + ri, ci, str(lst[ri]), ctr_fmt)
+            for ci in range(len(LIST_HDRS)):
+                ws.set_column(ci, ci, 28)
+            return r + max_r + 5
+
+        # Sheet 1 — Predictive Cycles Raw
+        ws1 = wb.add_worksheet("Predictive Cycles Raw")
+        row = 0
+        totals = aggregate_cycles_by_cycle(pred_cycles_dict, raw_pred)
+        for ck in sorted((k for k in totals if k.startswith('Cycle ')), key=_cycle_sort_key):
+            sdf = totals[ck]
+            if sdf.empty:
+                continue
+            cyc = _RE_CYCLE_NUM.search(ck).group(1)
+            row = write_cycle_block(ws1, ck, sdf.iloc[0], raw_pred[raw_pred['CYCLE'] == cyc], row)
+
+        # Sheet 2 — Overall Combined Raw
+        ws2 = wb.add_worksheet("Overall Combined Raw")
+        if not overall_total_df.empty:
+            ws2.write(0, 0, "Overall Combined Summary (Total Period)", bold)
+            for ci, h in enumerate(RAW_HDRS):
+                ws2.write(2, ci, h, hdr_fmt)
+            for ci, h in enumerate(RAW_HDRS):
+                ws2.write_number(3, ci, float(overall_total_df.iloc[0].get(h, 0)), num_fmt)
+            row = 6
+            for ci, h in enumerate(LIST_HDRS):
+                ws2.write(row, ci, h, hdr_fmt)
+            row += 1
+
+            if raw_combined.empty:
+                ws2.write(row, 0, "(No raw data)", no_data)
+            else:
+                conn_m = raw_combined['TALK TIME DURATION'] > 0
+                ptp_m  = raw_combined['PTP AMOUNT'] > 0
+                rpc_m  = raw_combined['STATUS'].str.contains(_RE_RPC_ESC, na=False)
+                neg_m  = raw_combined['STATUS'].str.contains(_RE_NEG_DROP, na=False)
+                drp_m  = raw_combined['STATUS'].str.contains(_RE_DROPPED,  na=False)
+
+                lists = [
+                    sorted(raw_combined['CARD NO.'].dropna().unique()),
+                    list(raw_combined.loc[conn_m, 'CARD NO.']),
+                    sorted(raw_combined.loc[conn_m, 'CARD NO.'].dropna().unique()),
+                    sorted(raw_combined.loc[ptp_m | rpc_m, 'CARD NO.'].dropna().unique()),
+                    sorted(raw_combined.loc[ptp_m & conn_m, 'CARD NO.'].dropna().unique()),
+                    sorted(raw_combined.loc[neg_m, 'CARD NO.'].dropna().unique()),
+                    sorted(raw_combined.loc[drp_m, 'CARD NO.'].dropna().unique()),
+                ]
+                max_r = max((len(l) for l in lists), default=0)
+                for ri in range(max_r):
+                    for ci, lst in enumerate(lists):
+                        if ri < len(lst):
+                            ws2.write(row + ri, ci, str(lst[ri]), ctr_fmt)
+                for ci in range(len(LIST_HDRS)):
+                    ws2.set_column(ci, ci, 28)
+
+        # Sheet 3 — Overall Combined Cycles Raw
+        ws3 = wb.add_worksheet("Overall Combined Cycles Raw")
+        row = 0
+        for ck, sdf in overall_cycles_dict.items():
+            if sdf.empty:
+                continue
+            cyc = _RE_CYCLE_NUM.search(ck).group(1)
+            row = write_cycle_block(ws3, ck, sdf.iloc[0],
+                                    raw_combined[raw_combined['CYCLE'] == cyc], row, is_combined=True)
+
+    return output.getvalue()
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+uploaded_files = st.sidebar.file_uploader(
+    "Upload Daily Remark Files", type="xlsx", accept_multiple_files=True
+)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 📅 Date Range Filter")
+st.sidebar.caption("Only data within this range will be processed.")
+
+_today = datetime.date.today()
+_30ago = _today - datetime.timedelta(days=30)
+
+date_filter_on = st.sidebar.toggle("Enable date range filter", value=False)
+
+if date_filter_on:
+    c1, c2 = st.sidebar.columns(2)
+    start_date = c1.date_input("Start", value=_30ago, key="sd")
+    end_date   = c2.date_input("End",   value=_today, key="ed")
+    if start_date > end_date:
+        st.sidebar.error("⚠️ Start must be ≤ End date.")
+        st.stop()
+    st.sidebar.info(f"📆 {start_date:%b %d, %Y} → {end_date:%b %d, %Y}")
 else:
+    start_date = end_date = None
+    st.sidebar.caption("_Filter off — all dates processed._")
+
+st.sidebar.markdown("---")
+
+# ── Main processing ───────────────────────────────────────────────────────────
+
+if not uploaded_files:
     st.info("Upload one or more XLSX files to start.")
+    st.stop()
+
+if date_filter_on:
+    st.info(f"📅 **Date filter active:** {start_date:%B %d, %Y} → {end_date:%B %d, %Y}")
+
+# Collect into lists; single pd.concat per accumulator (avoids O(n²) frame copies)
+raw_pred_frames, raw_comb_frames = [], []
+all_combined, all_predictive, all_manual = [], [], []
+pred_cycles_acc:  dict[str, list] = {}
+man_cycles_acc:   dict[str, list] = {}
+pred_bals_acc:    dict[str, list] = {}
+man_bals_acc:     dict[str, list] = {}
+
+prog = st.progress(0)
+n    = len(uploaded_files)
+
+for idx, f in enumerate(uploaded_files):
+    with st.spinner(f"Processing {f.name}…"):
+        df = load_data(f)
+        df = process_file(df)
+
+        if date_filter_on:
+            df = apply_date_filter(df, start_date, end_date)
+            if df.empty:
+                prog.progress((idx + 1) / n)
+                continue
+
+        if 'REMARK TYPE' not in df.columns:
+            prog.progress((idx + 1) / n)
+            continue
+
+        follow_up  = df[
+            (df['REMARK TYPE'] == 'Follow Up') &
+            df.get('REMARK', pd.Series(dtype=str)).str.contains('Predictive', case=False, na=False)
+        ]
+        predictive = df[df['REMARK TYPE'] == 'Predictive']
+        outgoing   = df[df['REMARK TYPE'] == 'Outgoing']
+
+        pred_combined = pd.concat([follow_up, predictive], ignore_index=True)
+        combined      = pd.concat([pred_combined, outgoing], ignore_index=True)
+
+        raw_pred_frames.append(pred_combined)
+        raw_comb_frames.append(combined)
+
+        all_combined.append(calculate_summary(combined,      ['Predictive', 'Follow Up', 'Outgoing']))
+        all_predictive.append(calculate_summary(pred_combined, ['Predictive', 'Follow Up']))
+        all_manual.append(calculate_summary(outgoing,        ['Outgoing']))
+
+        for k, v in get_cycle_summary(pred_combined, ['Predictive', 'Follow Up']).items():
+            pred_cycles_acc.setdefault(k, []).append(v)
+        for k, v in get_cycle_summary(outgoing, ['Outgoing']).items():
+            man_cycles_acc.setdefault(k, []).append(v)
+        for k, v in get_balance_summary(pred_combined, ['Predictive', 'Follow Up']).items():
+            pred_bals_acc.setdefault(k, []).append(v)
+        for k, v in get_balance_summary(outgoing, ['Outgoing']).items():
+            man_bals_acc.setdefault(k, []).append(v)
+
+    prog.progress((idx + 1) / n)
+
+prog.empty()
+
+# Final single-concat per accumulator
+def _merge(acc: dict) -> dict:
+    return {k: pd.concat(v, ignore_index=True) for k, v in acc.items()}
+
+def _concat_summaries(frames: list) -> pd.DataFrame:
+    valid = [f for f in frames if not f.empty]
+    return pd.concat(valid, ignore_index=True).sort_values('DATE') if valid else _empty_summary()
+
+raw_predictive_all = pd.concat(raw_pred_frames, ignore_index=True) if raw_pred_frames else pd.DataFrame()
+raw_combined_all   = pd.concat(raw_comb_frames, ignore_index=True) if raw_comb_frames else pd.DataFrame()
+
+if raw_combined_all.empty:
+    st.warning("⚠️ No records found in the selected date range. Adjust the filter or disable it.")
+    st.stop()
+
+pred_cycles_merged = _merge(pred_cycles_acc)
+man_cycles_merged  = _merge(man_cycles_acc)
+pred_bals_merged   = _merge(pred_bals_acc)
+man_bals_merged    = _merge(man_bals_acc)
+
+combined_summary   = _concat_summaries(all_combined)
+predictive_summary = _concat_summaries(all_predictive)
+manual_summary     = _concat_summaries(all_manual)
+
+combined_cycle         = combine_summaries(pred_cycles_merged, man_cycles_merged)
+combined_balance       = combine_summaries(pred_bals_merged,   man_bals_merged)
+pred_cycles_total      = aggregate_cycles_by_cycle(pred_cycles_merged, raw_predictive_all)
+overall_combined_total = aggregate_overall_summary(raw_combined_all, combined_summary)
+overall_combined_cycs  = aggregate_overall_combined_cycles(combined_cycle, raw_combined_all)
+
+date_tag = (f" — filtered {start_date:%b %d} – {end_date:%b %d, %Y}" if date_filter_on else "")
+st.success(f"✅ Processed {n} file(s){date_tag}")
+
+# ── Display ───────────────────────────────────────────────────────────────────
+
+st.write("## Overall Combined Summary (Daily)")
+st.dataframe(combined_summary, use_container_width=True)
+
+if not overall_combined_total.empty:
+    st.write("## Overall Combined Summary (Total Period)")
+    st.dataframe(overall_combined_total, use_container_width=True)
+
+if overall_combined_cycs:
+    st.write("## Overall Combined Cycles (Total per Cycle)")
+    for ck in sorted(overall_combined_cycs, key=_cycle_sort_key):
+        st.subheader(f"{ck} Summary")
+        st.dataframe(overall_combined_cycs[ck], use_container_width=True)
+
+for title, df in [("Overall Predictive", predictive_summary), ("Overall Manual", manual_summary)]:
+    if not df.empty:
+        st.write(f"## {title} Summary")
+        st.dataframe(df, use_container_width=True)
+
+# ── Exports ───────────────────────────────────────────────────────────────────
+
+date_suffix = (f"_{start_date:%Y%m%d}_to_{end_date:%Y%m%d}"
+               if date_filter_on else f"_{datetime.datetime.now():%Y%m%d_%H%M%S}")
+
+summary_groups = {
+    'Combined':                  {'Combined Summary (Daily)': combined_summary},
+    'Overall Combined Summary':  {'Overall Combined Summary (Total)': overall_combined_total},
+    'Overall Combined Cycles':   overall_combined_cycs,
+    'Predictive':                {'Predictive Summary': predictive_summary},
+    'Manual':                    {'Manual Summary': manual_summary},
+    'Combined Cycles':           {k: v for k, v in combined_cycle.items()       if 'na' not in k.lower()},
+    'Predictive Cycles':         {k: v for k, v in pred_cycles_merged.items()   if 'na' not in k.lower()},
+    'Manual Cycles':             {k: v for k, v in man_cycles_merged.items()    if 'na' not in k.lower()},
+    'Predictive Cycles (Total)': pred_cycles_total,
+    'Combined Balances':         combined_balance,
+    'Predictive Balances':       pred_bals_merged,
+    'Manual Balances':           man_bals_merged,
+}
+
+st.sidebar.download_button(
+    label="📥 Download All Summaries",
+    data=to_excel(summary_groups),
+    file_name=f"Debt_Collection_Summary{date_suffix}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
+st.sidebar.download_button(
+    label="📥 Download Raw Cycle Breakdown",
+    data=create_raw_cycle_breakdown_excel(
+        raw_predictive_all, raw_combined_all,
+        pred_cycles_merged, overall_combined_total, overall_combined_cycs,
+    ),
+    file_name=f"Raw_Cycle_Breakdown{date_suffix}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)

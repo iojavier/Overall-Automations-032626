@@ -58,6 +58,31 @@ def setup_excel_formats(workbook):
                                      'border': 1, 'num_format': 'hh:mm:ss'})
     }
 
+def parse_percentage_value(value):
+    if pd.isna(value):
+        return 0.0
+
+    if isinstance(value, str):
+        cleaned = value.strip().replace(',', '')
+        if not cleaned:
+            return 0.0
+
+        has_percent = '%' in cleaned
+        cleaned = cleaned.rstrip('%').strip()
+        numeric = pd.to_numeric(cleaned, errors='coerce')
+        if pd.isna(numeric):
+            return np.nan
+        return float(numeric) / 100 if has_percent else float(numeric)
+
+    numeric = pd.to_numeric(value, errors='coerce')
+    return float(numeric) if not pd.isna(numeric) else np.nan
+
+def normalize_percentage_columns(df):
+    for col in PERCENTAGE_COLS:
+        if col in df.columns:
+            df[col] = df[col].apply(parse_percentage_value)
+    return df
+
 # ----------------------------------------------------------------------
 # EXCEL WRITER (unchanged)
 # ----------------------------------------------------------------------
@@ -126,11 +151,7 @@ def write_excel_sheet(writer, sheet_name, df_dict, formats):
                 if col in df_display.columns:
                     df_display[col] = pd.to_numeric(df_display[col], errors='coerce').fillna(0)
 
-            for col in PERCENTAGE_COLS:
-                if col in df_display.columns and df_display[col].dtype == 'object':
-                    df_display[col] = (df_display[col].astype(str)
-                                     .str.rstrip('%').str.replace(',', '')
-                                     .astype(float).fillna(0) / 100)
+            df_display = normalize_percentage_columns(df_display)
         
         worksheet.merge_range(current_row, 0, current_row, len(df_display.columns) - 1, title, formats['title'])
         current_row += 1
@@ -159,7 +180,11 @@ def write_excel_sheet(writer, sheet_name, df_dict, formats):
                 elif col_name == 'TOTAL BALANCE':
                     worksheet.write_number(current_row + row_num, col_num, float(value), formats['comma'])
                 elif col_name in PERCENTAGE_COLS:
-                    worksheet.write_number(current_row + row_num, col_num, float(value), formats['percent'])
+                    percent_value = parse_percentage_value(value)
+                    if pd.isna(percent_value):
+                        worksheet.write(current_row + row_num, col_num, value, formats['center'])
+                    else:
+                        worksheet.write_number(current_row + row_num, col_num, percent_value, formats['percent'])
                 elif col_name in ['TOTAL TALK TIME', 'TALK TIME AVE']:
                     worksheet.write_string(current_row + row_num, col_num, str(value), formats['time'])
                 elif col_name == 'Count' or col_name in NUMERICAL_COLS:
@@ -500,9 +525,7 @@ def combine_summaries(pred, man):
         df['DATE'] = pd.to_datetime(df['DATE']).dt.date
         df['TOTAL_TALK_TIME_SECS'] = df['TOTAL TALK TIME'].apply(hms_to_seconds)
 
-        for col in PERCENTAGE_COLS:
-            if col in df.columns:
-                df[col] = (df[col].astype(str).str.rstrip('%').str.replace(',', '').astype(float).fillna(0) / 100)
+        df = normalize_percentage_columns(df)
 
         agg = {c: 'sum' for c in NUMERICAL_COLS if c in df.columns}
         agg['TOTAL_TALK_TIME_SECS'] = 'sum'

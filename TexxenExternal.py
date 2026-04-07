@@ -567,17 +567,17 @@ def combine_summaries(pred_dict, man_dict):
         agg['PENETRATION RATE'] = agg.apply(
             lambda r: f"{(r['TOTAL DIALED'] / r['ACCOUNTS'] * 100):.2f}%" if r['ACCOUNTS'] > 0 else "0.00%", axis=1)
         agg['CONNECTED % NU'] = agg.apply(
-            lambda r: f"{(r['CONNECTED NU'] / r['ACCOUNTS'] * 100):.2f}%" if r['ACCOUNTS'] > 0 else "0.00%", axis=1)
+            lambda r: f"{(r['CONNECTED NU'] / r['TOTAL DIALED'] * 100):.2f}%" if r['ACCOUNTS'] > 0 else "0.00%", axis=1)
         agg['CONNECTED % UNIQUE'] = agg.apply(
             lambda r: f"{(r['CONNECTED UNIQUE'] / r['ACCOUNTS'] * 100):.2f}%" if r['ACCOUNTS'] > 0 else "0.00%", axis=1)
 
         agg['RPC %'] = agg.apply(
-            lambda r: f"{(r['TOTAL RPC'] / r['CONNECTED UNIQUE'] * 100):.2f}%" if r['CONNECTED UNIQUE'] > 0 else "0.00%", axis=1)
+            lambda r: f"{(r['TOTAL RPC'] / r['TOTAL DIALED'] * 100):.2f}%" if r['CONNECTED UNIQUE'] > 0 else "0.00%", axis=1)
 
         agg['PTP %'] = agg.apply(
             lambda r: f"{(r['PTP'] / r['TOTAL RPC'] * 100):.2f}%" if r['TOTAL RPC'] > 0 else "0.00%", axis=1)
         agg['CALL DROP RATE'] = agg.apply(
-            lambda r: f"{((r['NEG DROP'] + r['SYSTEM DROP']) / r['ACCOUNTS'] * 100):.2f}%" if r['ACCOUNTS'] > 0 else "0.00%", axis=1)
+            lambda r: f"{((r['SYSTEM DROP']) / r['ACCOUNTS'] * 100):.2f}%" if r['ACCOUNTS'] > 0 else "0.00%", axis=1)
 
         agg['CYCLE'] = key.replace("Cycle ", "") if "Cycle " in key else ""
 

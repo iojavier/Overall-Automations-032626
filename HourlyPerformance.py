@@ -1,20 +1,36 @@
-import streamlit as st
 import pandas as pd
-from io import BytesIO
-from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
-from openpyxl.utils import get_column_letter
-from collections import defaultdict
+import polars as pl
+import streamlit as st
+from io import BytesIO, StringIO
+
 
 st.set_page_config(page_title="Hourly Performance Report", layout="wide")
 st.title("Call Summary & DRR Predictive Performance")
 
-time_groups = ["7am", "8am", "9am", "10am", "11am", "12pm",
-               "1pm", "2pm", "3pm", "4pm", "5pm", "6pm", "7pm", "8pm"]
+time_groups = [
+    "7am", "8am", "9am", "10am", "11am", "12pm",
+    "1pm", "2pm", "3pm", "4pm", "5pm", "6pm", "7pm", "8pm",
+]
+
+TIME_GROUP_MAP = {
+    7: "7am", 8: "8am", 9: "9am", 10: "10am", 11: "11am", 12: "12pm",
+    13: "1pm", 14: "2pm", 15: "3pm", 16: "4pm", 17: "5pm", 18: "6pm",
+    19: "7pm", 20: "8pm",
+}
+
+DRR_FORMATS = [
+    "%d/%m/%Y %I:%M:%S %p",
+    "%d/%m/%Y %I:%M %p",
+    "%d/%m/%Y %H:%M:%S",
+    "%d-%m-%Y %I:%M:%S %p",
+    "%d-%m-%Y %H:%M:%S",
+    "%d/%m/%Y",
+]
+
 
 def get_time_group(hour):
-    return {7: "7am", 8: "8am", 9: "9am", 10: "10am", 11: "11am", 12: "12pm",
-            13: "1pm", 14: "2pm", 15: "3pm", 16: "4pm", 17: "5pm",
-            18: "6pm", 19: "7pm", 20: "8pm"}.get(hour)
+    return TIME_GROUP_MAP.get(hour)
+
 
 def find_column(df, names):
     cols_lower = {c.strip().lower(): c for c in df.columns}
@@ -23,98 +39,158 @@ def find_column(df, names):
             return cols_lower[name.strip().lower()]
     return None
 
-def parse_drr_datetime(row):
-    date_str = str(row.get("Date", "")).strip()
-    time_str = str(row.get("Time", "")).strip()
-    if not date_str or date_str in ["nan", ""]: 
-        return pd.NaT
-    full_str = f"{date_str} {time_str or '12:00AM'}"
-    formats = [
-        '%d/%m/%Y %I:%M:%S %p', '%d/%m/%Y %I:%M %p', '%d/%m/%Y %H:%M:%S',
-        '%d-%m-%Y %I:%M:%S %p', '%d-%m-%Y %H:%M:%S', '%d/%m/%Y'
-    ]
-    for fmt in formats:
-        try:
-            return pd.to_datetime(full_str, format=fmt, dayfirst=True)
-        except:
-            continue
-    return pd.to_datetime(full_str, dayfirst=True, errors='coerce')
 
-# ====================== CORRECTED STYLE FUNCTION ======================
+@st.cache_data(show_spinner=False)
+def load_uploaded_dataframe(file_name: str, file_bytes: bytes) -> pd.DataFrame:
+    try:
+        if file_name.lower().endswith(".xlsx"):
+            return pl.read_excel(BytesIO(file_bytes), engine="calamine").to_pandas()
+
+        return pl.read_csv(
+            BytesIO(file_bytes),
+            infer_schema_length=10000,
+            ignore_errors=True,
+            try_parse_dates=False,
+        ).to_pandas()
+    except Exception:
+        if file_name.lower().endswith(".xlsx"):
+            return pd.read_excel(BytesIO(file_bytes))
+
+        for encoding in ("utf-8", "utf-8-sig", "latin1"):
+            try:
+                return pd.read_csv(StringIO(file_bytes.decode(encoding)), low_memory=False)
+            except UnicodeDecodeError:
+                continue
+        return pd.read_csv(BytesIO(file_bytes), low_memory=False)
+
+
+def parse_drr_datetime_columns(df):
+    date_series = df["Date"]
+    time_series = df["Time"]
+    parsed = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+
+    date_direct = pd.to_datetime(date_series, dayfirst=True, errors="coerce")
+    parsed.loc[date_direct.notna()] = date_direct.loc[date_direct.notna()]
+
+    date_numeric = pd.to_numeric(date_series, errors="coerce")
+    date_excel = pd.to_datetime(date_numeric, unit="D", origin="1899-12-30", errors="coerce")
+    parsed.loc[parsed.isna() & date_excel.notna()] = date_excel.loc[parsed.isna() & date_excel.notna()]
+
+    time_direct = pd.to_datetime(time_series, errors="coerce")
+    time_numeric = pd.to_numeric(time_series, errors="coerce")
+    time_excel = pd.to_datetime(time_numeric, unit="D", origin="1899-12-30", errors="coerce")
+
+    has_time_direct = time_direct.notna()
+    parsed.loc[has_time_direct] = parsed.loc[has_time_direct].fillna(pd.Timestamp("1899-12-30")) + (
+        time_direct.loc[has_time_direct] - time_direct.loc[has_time_direct].dt.normalize()
+    )
+
+    has_time_excel = ~has_time_direct & time_excel.notna()
+    parsed.loc[has_time_excel] = parsed.loc[has_time_excel].fillna(pd.Timestamp("1899-12-30")) + (
+        time_excel.loc[has_time_excel] - time_excel.loc[has_time_excel].dt.normalize()
+    )
+
+    remaining = parsed.isna()
+    if remaining.any():
+        date_text = date_series.fillna("").astype(str).str.strip()
+        time_text = time_series.fillna("").astype(str).str.strip()
+        combined = date_text + " " + time_text.where(time_text.ne(""), "12:00AM")
+        valid = remaining & date_text.ne("") & date_text.ne("nan")
+        combined_valid = combined[valid]
+
+        for fmt in DRR_FORMATS:
+            still_missing = parsed[valid].isna()
+            if not still_missing.any():
+                break
+            idx = combined_valid.index[still_missing]
+            parsed.loc[idx] = pd.to_datetime(combined_valid.loc[idx], format=fmt, dayfirst=True, errors="coerce")
+
+        still_missing = parsed[valid].isna()
+        if still_missing.any():
+            idx = combined_valid.index[still_missing]
+            parsed.loc[idx] = pd.to_datetime(combined_valid.loc[idx], dayfirst=True, errors="coerce")
+
+    return parsed
+
+
+def build_time_metric_row(label, metrics_by_group, metric_name):
+    return [label] + [int(metrics_by_group[tg].get(metric_name, 0)) for tg in time_groups]
+
+
 def style_excel(blocks):
-    """Styles the Excel sheet and saves the blocks."""
     output = BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         workbook = writer.book
-        # Remove default sheet if it exists, before creating the new one
-        if "Sheet" in workbook.sheetnames:
-            workbook.remove(workbook["Sheet"])
-        ws = workbook.create_sheet("Summary Report")
+        worksheet = workbook.add_worksheet("Summary Report")
 
-        # Define styles
-        border = Border(left=Side('thin'), right=Side('thin'), top=Side('thin'), bottom=Side('thin'))
-        bold = Font(bold=True)
-        center = Alignment(horizontal='center', vertical='center')
-        red_fill = PatternFill(start_color="963634", end_color="963634", fill_type="solid")
-        white_font = Font(bold=True, color="FFFFFF")
-        gray_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
+        title_fmt = workbook.add_format({
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+            "bg_color": "#963634",
+            "font_color": "white",
+        })
+        header_fmt = workbook.add_format({
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+            "bg_color": "#D3D3D3",
+        })
+        label_fmt = workbook.add_format({
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+        })
+        cell_fmt = workbook.add_format({
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+        })
 
-        row = 1
+        row = 0
+        max_cols = len(time_groups) + 1
         for block in blocks:
             for r_idx, row_data in enumerate(block):
-                current_row = row + r_idx
-                col_count = len(row_data) 
-                
-                # Check for Red Headers (Merge and Style)
+                col_count = len(row_data)
                 if r_idx == 0 and str(row_data[0]).startswith(("TOTAL ", "--- DRR", "DRR Predictive")):
-                    header_text = row_data[0]
-                    
-                    # 1. Write the value to the top-left cell (A-column)
-                    cell = ws.cell(current_row, 1, header_text)
-                    
-                    # 2. Apply styling
-                    cell.fill = red_fill
-                    cell.font = white_font
-                    cell.alignment = center
-                    
-                    # 3. Merge the cells
-                    ws.merge_cells(start_row=current_row, start_column=1,
-                                   end_row=current_row, end_column=col_count)
-
-                    # 4. Apply border to the entire merged range
-                    for c_idx in range(1, col_count + 1):
-                         # Note: Use ws.cell() without specifying value here
-                         ws.cell(current_row, c_idx).border = border
-
+                    worksheet.merge_range(row, 0, row, col_count - 1, row_data[0], title_fmt)
                 else:
-                    # Normal data rows
-                    for c_idx, value in enumerate(row_data, 1):
-                        # This writes the value and retrieves the cell object
-                        cell = ws.cell(current_row, c_idx, value) 
-                        cell.border = border
-                        cell.alignment = center
+                    is_time_header = len(row_data) > 1 and row_data[0] == "" and row_data[1] in time_groups
+                    for c_idx, value in enumerate(row_data):
+                        fmt = header_fmt if is_time_header else (label_fmt if c_idx == 0 else cell_fmt)
+                        worksheet.write(row, c_idx, value, fmt)
+                row += 1
+            row += 2
 
-                        # Time group headers (gray)
-                        if len(row_data) > 1 and c_idx > 1 and row_data[1] in time_groups:
-                            cell.fill = gray_fill
-                            cell.font = bold
-                        
-                        # First column bold
-                        elif c_idx == 1:
-                            cell.font = bold
-
-            row += len(block) + 2  # Extra spacing
-
-        # Auto-adjust column widths
-        for col in range(1, len(time_groups) + 2):
-            ws.column_dimensions[get_column_letter(col)].width = 13
+        worksheet.set_column(0, max_cols - 1, 13)
 
     output.seek(0)
-    return output
-# ====================== END OF CORRECTED STYLE FUNCTION ======================
+    return output.getvalue()
 
 
-# ====================== SIDEBAR ======================
+def blocks_to_dataframe(blocks):
+    rows = []
+    width = len(time_groups) + 1
+    columns = ["Label"] + time_groups
+
+    for block in blocks:
+        for row in block:
+            padded = list(row) + [""] * (width - len(row))
+            rows.append(padded[:width])
+        rows.append([""] * width)
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+@st.cache_data(show_spinner=False)
+def build_csv_bytes(blocks):
+    df = blocks_to_dataframe(blocks)
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
 st.sidebar.markdown("### 1. Call History Files (xlsx/csv)")
 call_files = st.sidebar.file_uploader("Upload Call History", type=["xlsx", "csv"], accept_multiple_files=True, key="call")
 
@@ -122,86 +198,116 @@ st.sidebar.markdown("### 2. DRR Files (xlsx/csv)")
 drr_files = st.sidebar.file_uploader("Upload DRR Files", type=["xlsx", "csv"], accept_multiple_files=True, key="drr")
 
 call_infos = []
-drr_by_date_hour = defaultdict(lambda: defaultdict(lambda: {
-    "agents": set(), "dials": 0, "connected": 0, "rpc": 0, "ptp": 0
-}))
+date_totals = {}
+drr_by_date_hour = {}
+processed_call_files = 0
+processed_drr_files = 0
+drr_debug_messages = []
 
-# ====================== PROCESS CALL HISTORY ======================
+
 if call_files:
-    date_totals = defaultdict(lambda: {tg: {"agents": set(), "dials": 0, "connected": 0} for tg in time_groups})
-
     for file in call_files:
         try:
-            df = pd.read_excel(file) if file.name.endswith(".xlsx") else pd.read_csv(file)
+            df = load_uploaded_dataframe(file.name, file.getvalue())
             date_col = find_column(df, ["Call Date", "Date", "call_date"])
             agent_col = find_column(df, ["Collector Name", "Agent", "Collector", "collector_name"])
             status_col = find_column(df, ["Final Dial Status", "Status", "final_status"])
 
             if not date_col:
-                st.warning(f"⚠️ Missing date column in {file.name}")
+                st.warning(f"Missing date column in {file.name}")
                 continue
 
-            df = df.rename(columns={date_col: "Date", agent_col: "Agent", status_col: "Status"})
-            df["datetime"] = pd.to_datetime(df["Date"], dayfirst=True, errors='coerce')
+            rename_map = {date_col: "Date"}
+            if agent_col:
+                rename_map[agent_col] = "Agent"
+            if status_col:
+                rename_map[status_col] = "Status"
+            df = df.rename(columns=rename_map)
+
+            df["datetime"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
             df = df.dropna(subset=["datetime"])
-            df["hour"] = df["datetime"].dt.hour
-            df["time_group"] = df["hour"].apply(get_time_group)
-            df = df[df["time_group"].notna()]
             if df.empty:
                 continue
 
+            df["time_group"] = df["datetime"].dt.hour.map(TIME_GROUP_MAP)
+            df = df[df["time_group"].notna()].copy()
+            if df.empty:
+                continue
+            processed_call_files += 1
+
             date_str = df["datetime"].dt.strftime("%Y-%m-%d").iloc[0]
+            grouped = df.groupby("time_group", sort=False)
 
-            summary = {tg: {"agents": 0, "dials": 0, "connected": 0} for tg in time_groups}
-            agents_set = {tg: set() for tg in time_groups}
+            dials = grouped.size().reindex(time_groups, fill_value=0)
+            if "Agent" in df.columns:
+                agents = grouped["Agent"].nunique(dropna=True).reindex(time_groups, fill_value=0)
+                agent_sets = grouped["Agent"].agg(
+                    lambda s: set(s.dropna().astype(str).unique())
+                ).reindex(time_groups, fill_value=set())
+            else:
+                agents = pd.Series(0, index=time_groups)
+                agent_sets = pd.Series([set() for _ in time_groups], index=time_groups)
 
-            for tg in time_groups:
-                sub = df[df["time_group"] == tg]
-                if sub.empty:
-                    continue
-                agents = sub["Agent"].dropna().astype(str).unique()
-                agents_set[tg].update(agents)
-                summary[tg]["agents"] = len(agents)
-                summary[tg]["dials"] = len(sub)
-                if "Status" in df.columns:
-                    summary[tg]["connected"] = sub["Status"].astype(str).str.contains("transferred|dropped", case=False, na=False).sum()
+            if "Status" in df.columns:
+                connected_mask = df["Status"].astype(str).str.contains("transferred|dropped", case=False, na=False)
+                connected = (
+                    df.assign(connected=connected_mask.astype("int8"))
+                    .groupby("time_group")["connected"]
+                    .sum()
+                    .reindex(time_groups, fill_value=0)
+                )
+            else:
+                connected = pd.Series(0, index=time_groups)
+
+            metrics_by_group = {
+                tg: {
+                    "agents": int(agents.loc[tg]),
+                    "dials": int(dials.loc[tg]),
+                    "connected": int(connected.loc[tg]),
+                }
+                for tg in time_groups
+            }
 
             block = [
                 [f"{date_str} Call History"] + time_groups,
-                ["Active agents"] + [summary[tg]["agents"] for tg in time_groups],
+                build_time_metric_row("Active agents", metrics_by_group, "agents"),
                 ["Accounts"] + [""] * len(time_groups),
-                ["Dials"] + [summary[tg]["dials"] for tg in time_groups],
-                ["Connected"] + [summary[tg]["connected"] for tg in time_groups]
+                build_time_metric_row("Dials", metrics_by_group, "dials"),
+                build_time_metric_row("Connected", metrics_by_group, "connected"),
             ]
-            call_infos.append({"date": date_str, "block": block, "agents": agents_set, "summary": summary})
+            call_infos.append({"date": date_str, "block": block})
 
-            # Accumulate totals per date
+            total_bucket = date_totals.setdefault(
+                date_str,
+                {tg: {"agents": set(), "dials": 0, "connected": 0} for tg in time_groups},
+            )
             for tg in time_groups:
-                date_totals[date_str][tg]["agents"].update(agents_set[tg])
-                date_totals[date_str][tg]["dials"] += summary[tg]["dials"]
-                date_totals[date_str][tg]["connected"] += summary[tg]["connected"]
+                total_bucket[tg]["agents"].update(agent_sets.loc[tg] if tg in agent_sets.index else set())
+                total_bucket[tg]["dials"] += metrics_by_group[tg]["dials"]
+                total_bucket[tg]["connected"] += metrics_by_group[tg]["connected"]
 
         except Exception as e:
             st.error(f"Call History error in {file.name}: {e}")
 
-# ====================== PROCESS DRR FILES ======================
+
 if drr_files:
     for file in drr_files:
         try:
-            df = pd.read_excel(file) if file.name.endswith(".xlsx") else pd.read_csv(file)
+            df = load_uploaded_dataframe(file.name, file.getvalue())
             if df.empty:
+                drr_debug_messages.append(f"{file.name}: file loaded but has no rows.")
                 continue
 
             cols = {
-                "remark_type": find_column(df, ["Remark Type", "remark_type"]),
-                "remark": find_column(df, ["Remark", "remark"]),
-                "remark_by": find_column(df, ["Remark By"]),
-                "debtor_id": find_column(df, ["Debtor ID"]),
-                "talk_time": find_column(df, ["Talk Time Duration"]),
-                "date": find_column(df, ["Date"]),
-                "time": find_column(df, ["Time"]),
-                "status": find_column(df, ["Status"]),
-                "ptp": find_column(df, ["PTP Amount"])
+                "Remark Type": find_column(df, ["Remark Type", "remark_type"]),
+                "Remark": find_column(df, ["Remark", "remark"]),
+                "Remark By": find_column(df, ["Remark By"]),
+                "Debtor ID": find_column(df, ["Debtor ID"]),
+                "Talk Time Duration": find_column(df, ["Talk Time Duration"]),
+                "Date": find_column(df, ["Date"]),
+                "Time": find_column(df, ["Time"]),
+                "Status": find_column(df, ["Status"]),
+                "PTP Amount": find_column(df, ["PTP Amount"]),
             }
 
             missing = [k for k, v in cols.items() if v is None]
@@ -210,83 +316,107 @@ if drr_files:
                 continue
 
             df = df.rename(columns=cols)
-            df["datetime"] = df.apply(parse_drr_datetime, axis=1)
+            df["datetime"] = parse_drr_datetime_columns(df)
             df = df.dropna(subset=["datetime"])
-            df["date_str"] = df["datetime"].dt.strftime("%Y-%m-%d")
-            df["hour"] = df["datetime"].dt.hour
-            df["time_group"] = df["hour"].apply(get_time_group)
-            df = df[df["time_group"].notna()]
             if df.empty:
+                drr_debug_messages.append(f"{file.name}: no valid Date/Time rows were parsed.")
                 continue
 
-            df["Remark Type"] = df["Remark Type"].astype(str).str.strip()
-            df["Remark"] = df["Remark"].astype(str).str.lower()
-            df["Talk Time Duration"] = pd.to_numeric(df["Talk Time Duration"], errors='coerce').fillna(0)
-            df["PTP Amount"] = pd.to_numeric(df["PTP Amount"], errors='coerce').fillna(0)
+            df["time_group"] = df["datetime"].dt.hour.map(TIME_GROUP_MAP)
+            df = df[df["time_group"].notna()].copy()
+            if df.empty:
+                drr_debug_messages.append(f"{file.name}: rows were found, but none are within the supported 7am-8pm hourly groups.")
+                continue
 
-            # Predictive dials
+            df["date_str"] = df["datetime"].dt.strftime("%Y-%m-%d")
+            df["Remark Type"] = df["Remark Type"].astype(str).str.strip().str.lower()
+            df["Remark"] = df["Remark"].astype(str).str.lower()
+            df["Status"] = df["Status"].astype(str).str.lower()
+            df["Talk Time Duration"] = pd.to_numeric(df["Talk Time Duration"], errors="coerce").fillna(0)
+            df["PTP Amount"] = pd.to_numeric(df["PTP Amount"], errors="coerce").fillna(0)
+
             predictive_mask = (
-                (df["Remark Type"] == "Predictive") |
-                ((df["Remark Type"] == "Follow Up") & df["Remark"].str.contains("predictive cp", na=False))
+                df["Remark Type"].eq("predictive") |
+                (df["Remark Type"].eq("follow up") & df["Remark"].str.contains("predictive", na=False))
+            )
+            pred_df = df[predictive_mask].copy()
+            if pred_df.empty:
+                drr_debug_messages.append(f"{file.name}: no predictive rows matched after Remark Type filtering.")
+                continue
+
+            rpc_mask = (
+                pred_df["Status"].str.contains("bank escalation|rpc|ptp", na=False) |
+                ((pred_df["Status"] == "negative callouts - call drop") & pred_df["Remark"].str.contains("confirmed", na=False)) |
+                ((pred_df["Status"] == "negative callouts - busy_ooca") & pred_df["Remark"].str.contains("confirmed", na=False))
+            )
+            pred_df["rpc_flag"] = rpc_mask.astype("int8")
+            pred_df["ptp_flag"] = (pred_df["PTP Amount"] > 0).astype("int8")
+
+            base_grouped = pred_df.groupby(["date_str", "time_group"], sort=False).agg(
+                agents=("Remark By", lambda s: s.dropna().astype(str).nunique()),
+                dials=("date_str", "size"),
+                rpc=("rpc_flag", "sum"),
+                ptp=("ptp_flag", "sum"),
             )
 
-            pred_df = df[predictive_mask]
+            connected_grouped = (
+                pred_df.loc[pred_df["Talk Time Duration"] > 0]
+                .groupby(["date_str", "time_group"])["Debtor ID"]
+                .nunique()
+                .rename("connected")
+            )
 
-            for (date_str, tg), group in pred_df.groupby(["date_str", "time_group"]):
-                agents = group["Remark By"].dropna().astype(str).unique()
-                drr_by_date_hour[date_str][tg]["agents"].update(agents)
-                drr_by_date_hour[date_str][tg]["dials"] += len(group)
-                drr_by_date_hour[date_str][tg]["connected"] += group[group["Talk Time Duration"] > 0]["Debtor ID"].nunique()
+            merged = base_grouped.join(connected_grouped, how="left").fillna({"connected": 0}).reset_index()
+            if merged.empty:
+                drr_debug_messages.append(f"{file.name}: predictive rows were found, but grouping produced no hourly output.")
+                continue
 
-                s = group["Status"].astype(str).str.lower()
-                r = group["Remark"].astype(str).str.lower()
-                rpc_mask = (
-                    s.str.contains("bank escalation|rpc|ptp", na=False) |
-                    ((s == "negative callouts - call drop") & r.str.contains("confirmed", na=False)) |
-                    ((s == "negative callouts - busy_ooca") & r.str.contains("confirmed", na=False))
+            for row in merged.itertuples(index=False):
+                bucket = drr_by_date_hour.setdefault(
+                    row.date_str,
+                    {tg: {"agents": 0, "dials": 0, "connected": 0, "rpc": 0, "ptp": 0} for tg in time_groups},
                 )
-                drr_by_date_hour[date_str][tg]["rpc"] += rpc_mask.sum()
-                drr_by_date_hour[date_str][tg]["ptp"] += (group["PTP Amount"] > 0).sum()
+                bucket[row.time_group]["agents"] += int(row.agents)
+                bucket[row.time_group]["dials"] += int(row.dials)
+                bucket[row.time_group]["connected"] += int(row.connected)
+                bucket[row.time_group]["rpc"] += int(row.rpc)
+                bucket[row.time_group]["ptp"] += int(row.ptp)
+            processed_drr_files += 1
 
         except Exception as e:
             st.error(f"DRR processing error in {file.name}: {e}")
 
-# ====================== BUILD FINAL BLOCKS ======================
+
 final_blocks = []
 
-# Call History Blocks + Totals
-seen_dates = set()
-for info in call_infos:
-    date_str = info["date"]
-    if date_str not in seen_dates:
-        # Add total for previous date if exists
-        if seen_dates:
-            prev_date = list(seen_dates)[-1]
-            tot = date_totals[prev_date]
+if call_infos:
+    current_date = None
+    for info in call_infos:
+        date_str = info["date"]
+        if current_date is not None and date_str != current_date:
+            totals = date_totals[current_date]
             final_blocks.append([
-                [f"TOTAL {prev_date} (Call History)"] + time_groups,
-                ["Active agents"] + [len(tot[tg]["agents"]) for tg in time_groups],
+                [f"TOTAL {current_date} (Call History)"] + time_groups,
+                ["Active agents"] + [len(totals[tg]["agents"]) for tg in time_groups],
                 ["Accounts"] + [""] * len(time_groups),
-                ["Dials"] + [tot[tg]["dials"] for tg in time_groups],
-                ["Connected"] + [tot[tg]["connected"] for tg in time_groups]
+                ["Dials"] + [totals[tg]["dials"] for tg in time_groups],
+                ["Connected"] + [totals[tg]["connected"] for tg in time_groups],
             ])
-        seen_dates.add(date_str)
 
-    final_blocks.append(info["block"])
+        final_blocks.append(info["block"])
+        current_date = date_str
 
-# Add final total if any call files
-if seen_dates:
-    last_date = list(seen_dates)[-1]
-    tot = date_totals[last_date]
-    final_blocks.append([
-        [f"TOTAL {last_date} (Call History)"] + time_groups,
-        ["Active agents"] + [len(tot[tg]["agents"]) for tg in time_groups],
-        ["Accounts"] + [""] * len(time_groups),
-        ["Dials"] + [tot[tg]["dials"] for tg in time_groups],
-        ["Connected"] + [tot[tg]["connected"] for tg in time_groups]
-    ])
+    if current_date is not None:
+        totals = date_totals[current_date]
+        final_blocks.append([
+            [f"TOTAL {current_date} (Call History)"] + time_groups,
+            ["Active agents"] + [len(totals[tg]["agents"]) for tg in time_groups],
+            ["Accounts"] + [""] * len(time_groups),
+            ["Dials"] + [totals[tg]["dials"] for tg in time_groups],
+            ["Connected"] + [totals[tg]["connected"] for tg in time_groups],
+        ])
 
-# DRR Blocks
+
 if drr_by_date_hour:
     if final_blocks:
         final_blocks.append([["--- DRR PREDICTIVE PERFORMANCE ---"] + [""] * len(time_groups)])
@@ -295,17 +425,20 @@ if drr_by_date_hour:
         data = drr_by_date_hour[date_str]
         block = [
             [f"DRR Predictive {date_str}"] + time_groups,
-            ["", *time_groups],  # Proper time header
-            ["Agents"] + [len(data[tg]["agents"]) for tg in time_groups],
+            [""] + time_groups,
+            build_time_metric_row("Agents", data, "agents"),
             ["Accounts"] + [""] * len(time_groups),
-            ["Dials"] + [data[tg]["dials"] for tg in time_groups],
-            ["Connected"] + [data[tg]["connected"] for tg in time_groups],
-            ["RPC"] + [data[tg]["rpc"] for tg in time_groups],
-            ["PTP"] + [data[tg]["ptp"] for tg in time_groups]
+            build_time_metric_row("Dials", data, "dials"),
+            build_time_metric_row("Connected", data, "connected"),
+            build_time_metric_row("RPC", data, "rpc"),
+            build_time_metric_row("PTP", data, "ptp"),
         ]
         final_blocks.append(block)
 
-# ====================== DISPLAY ======================
+
+if processed_call_files or processed_drr_files:
+    st.caption(f"Processed call files: {processed_call_files} | Processed DRR files: {processed_drr_files}")
+
 if final_blocks:
     html = """
     <style>
@@ -340,11 +473,31 @@ if final_blocks:
     html += "</table>"
     st.markdown(html, unsafe_allow_html=True)
 
-    st.download_button(
-        label="📥 Download Excel Report",
-        data=style_excel(final_blocks),
-        file_name=f"Hourly_Performance_Report_{pd.Timestamp('today').strftime('%Y%m%d')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    report_date = pd.Timestamp("today").strftime("%Y%m%d")
+    excel_bytes = style_excel(final_blocks)
+    csv_bytes = build_csv_bytes(final_blocks)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            label="Download Excel Report",
+            data=excel_bytes,
+            file_name=f"Hourly_Performance_Report_{report_date}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with col2:
+        st.download_button(
+            label="Download CSV Report (Fast)",
+            data=csv_bytes,
+            file_name=f"Hourly_Performance_Report_{report_date}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 else:
-    st.info("👆 Please upload Call History and/or DRR files to generate the report.")
+    if drr_debug_messages:
+        st.warning("Files were uploaded, but no report rows were produced.")
+        for msg in drr_debug_messages:
+            st.write(f"- {msg}")
+    else:
+        st.info("Please upload Call History and/or DRR files to generate the report.")
